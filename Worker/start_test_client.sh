@@ -1,0 +1,2 @@
+python test_worker_client.py --worker localhost:50061 --video_path ./test_video.mp4 --chunk_size 1048576
+python test_worker_client.py --worker localhost:50061 --video_path ./test_video_large.mp4 --chunk_size 1048576
