@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+.tox/
+.nox/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+# Coverage analysis:
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+# Developer stuff
+.vscode/
+.idea/
+
+# Protobuf generated files
+replication_pb2.py
+replication_pb2_grpc.py
+replication_pb2.pyi
+
+# Generated video shard directories
+video_shards/
+retrieved_shards/
+
+# Example generated test video
+test_video*.mp4
+# Add other test video filenames if you create them
+
+# OS generated files
+.DS_Store
+.localized
+Thumbs.db
