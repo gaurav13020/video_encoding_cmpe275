@@ -85,6 +85,54 @@ The test client simulates a Master sending video chunks to a worker and retrievi
 
 - Verify Shard Content (Optional): While the simulated encoding doesn't produce a standard video format, you can inspect the retrieved `.shard` files. Their size should be smaller than the original chunks. You can also try concatenating them (`cat retrieved_shards/*.shard > reconstructed.bin`) and attempting to open the `reconstructed.bin` file with a tolerant player like VLC, although it's unlikely to play correctly due to the simulated encoding.
 
+
+
+
+## Health Check Features
+
+- **CheckHealth RPC**: A gRPC endpoint that allows the master to query a worker's health status.
+- **System Metrics**: The worker reports CPU utilization, memory usage, and the number of active tasks.
+- **Fault Detection**: The master maintains a list of active workers and marks unresponsive ones as "down".
+- **Threshold-Based Marking**: Workers are marked as unhealthy after multiple consecutive failed checks.
+
+## How It Works
+
+1. The master periodically calls the `CheckHealth` RPC on each registered worker.
+2. Each worker responds with its health status and system metrics.
+3. The master maintains a health status table for all workers.
+4. Workers that fail to respond or report unhealthy status are marked as "down" after reaching the unhealthy threshold.
+
+## Testing Health Checks
+
+You can test the health monitoring functionality by:
+
+1. Starting one or more worker instances:
+   ```bash
+   ./start_worker.sh --port=50061
+   ./start_worker.sh --port=50062
+   ```
+
+2. Running the health check monitor:
+   ```bash
+   ./start_health_checker.sh --master_id=master-1
+   ```
+
+The health checker will display a status table showing all workers' health and performance metrics.
+
+## Health Monitor Output
+
+The health monitor displays a table with the following information:
+
+- Worker Address
+- Health Status (HEALTHY or DOWN)
+- CPU Utilization (%)
+- Memory Usage (MB)
+- Active Tasks
+- Latency (ms)
+- Last Seen Time
+
+
+
 ## Further Development
 
 - Integrate a real video encoding library (like `ffmpeg`) into the `worker.py`'s `ProcessChunk` method to produce actual encoded video segments.
@@ -92,4 +140,3 @@ The test client simulates a Master sending video chunks to a worker and retrievi
 - Develop a Master process that handles client video uploads, chunks the video, selects workers (potentially using a load balancing or simple adaptive strategy for workers), sends chunks, and manages the metadata of the stored shards.
 
 - Implement a mechanism for the Master to reconstruct the full video from the stored shards based on client requests.
-
