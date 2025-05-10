@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import random
+import psutil
 from concurrent import futures
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,73 +28,82 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
         logging.info(f"Initializing Video Processing Worker {self.worker_id}")
         self._file_write_lock = asyncio.Lock() # Lock for writing shards
         self._file_read_lock = asyncio.Lock() # Lock for reading shards (less critical but good practice)
+        self._active_tasks = 0  # Counter for active processing tasks
+        self._active_tasks_lock = asyncio.Lock()  # Lock for the active tasks counter
 
 
     async def ProcessChunk(self, request: replication_pb2.ProcessChunkRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ProcessChunkResponse:
         """Receives a video chunk, simulates encoding, and stores it as a shard."""
-        video_id = request.video_id
-        chunk_index = request.chunk_index
-        chunk_data = request.chunk_data
-        original_size = len(chunk_data)
-
-        logging.info(f"[{self.worker_id}] Received chunk {chunk_index} for video '{video_id}' (Original size: {original_size} bytes)")
-
+        async with self._active_tasks_lock:
+            self._active_tasks += 1
+        
         try:
-            # --- Simulate Video Encoding ---
-            simulated_encoding_time = random.uniform(0.1, 1.0)
-            await asyncio.sleep(simulated_encoding_time)
+            video_id = request.video_id
+            chunk_index = request.chunk_index
+            chunk_data = request.chunk_data
+            original_size = len(chunk_data)
 
-            reduction_factor = random.uniform(0.5, 0.8)
-            encoded_data = chunk_data[:int(original_size * (1 - reduction_factor))]
-            encoded_size = len(encoded_data)
+            logging.info(f"[{self.worker_id}] Received chunk {chunk_index} for video '{video_id}' (Original size: {original_size} bytes)")
 
-            logging.info(f"[{self.worker_id}] Simulated encoding for chunk {chunk_index} (Encoded size: {encoded_size} bytes, Took {simulated_encoding_time:.2f}s)")
+            try:
+                # --- Simulate Video Encoding ---
+                simulated_encoding_time = random.uniform(0.1, 1.0)
+                await asyncio.sleep(simulated_encoding_time)
 
-            # --- Simulate Sharding and Storage ---
-            shard_filename = f"{video_id}_chunk_{chunk_index}.shard"
-            shard_path = os.path.join(SHARDS_DIR, shard_filename)
+                reduction_factor = random.uniform(0.5, 0.8)
+                encoded_data = chunk_data[:int(original_size * (1 - reduction_factor))]
+                encoded_size = len(encoded_data)
 
-            async with self._file_write_lock:
-                 try:
-                     with open(shard_path, "wb") as f:
-                         f.write(encoded_data)
-                     logging.info(f"[{self.worker_id}] Stored shard for chunk {chunk_index} at '{shard_path}'")
-                     shard_location = os.path.abspath(shard_path)
-                 except IOError as e:
-                     logging.error(f"[{self.worker_id}] Failed to write shard file '{shard_path}': {e}")
-                     context.set_details(f"Failed to store shard: {e}")
-                     context.set_code(grpc.StatusCode.INTERNAL)
-                     return replication_pb2.ProcessChunkResponse(
-                         success=False,
-                         worker_id=self.worker_id,
-                         shard_location="",
-                         original_size=original_size,
-                         encoded_size=0,
-                         message=f"Failed to store shard: {e}"
-                     )
+                logging.info(f"[{self.worker_id}] Simulated encoding for chunk {chunk_index} (Encoded size: {encoded_size} bytes, Took {simulated_encoding_time:.2f}s)")
 
-            logging.info(f"[{self.worker_id}] Successfully processed and stored chunk {chunk_index} for video '{video_id}'.")
-            return replication_pb2.ProcessChunkResponse(
-                success=True,
-                worker_id=self.worker_id,
-                shard_location=shard_location,
-                original_size=original_size,
-                encoded_size=encoded_size,
-                message="Chunk processed and sharded successfully"
-            )
+                # --- Simulate Sharding and Storage ---
+                shard_filename = f"{video_id}_chunk_{chunk_index}.shard"
+                shard_path = os.path.join(SHARDS_DIR, shard_filename)
 
-        except Exception as e:
-            logging.error(f"[{self.worker_id}] Unexpected error processing chunk {chunk_index} for video '{video_id}': {e}", exc_info=True)
-            context.set_details(f"Unexpected worker error: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            return replication_pb2.ProcessChunkResponse(
-                success=False,
-                worker_id=self.worker_id,
-                shard_location="",
-                original_size=original_size,
-                encoded_size=0,
-                message=f"Unexpected worker error: {e}"
-            )
+                async with self._file_write_lock:
+                     try:
+                         with open(shard_path, "wb") as f:
+                             f.write(encoded_data)
+                         logging.info(f"[{self.worker_id}] Stored shard for chunk {chunk_index} at '{shard_path}'")
+                         shard_location = os.path.abspath(shard_path)
+                     except IOError as e:
+                         logging.error(f"[{self.worker_id}] Failed to write shard file '{shard_path}': {e}")
+                         context.set_details(f"Failed to store shard: {e}")
+                         context.set_code(grpc.StatusCode.INTERNAL)
+                         return replication_pb2.ProcessChunkResponse(
+                             success=False,
+                             worker_id=self.worker_id,
+                             shard_location="",
+                             original_size=original_size,
+                             encoded_size=0,
+                             message=f"Failed to store shard: {e}"
+                         )
+
+                logging.info(f"[{self.worker_id}] Successfully processed and stored chunk {chunk_index} for video '{video_id}'.")
+                return replication_pb2.ProcessChunkResponse(
+                    success=True,
+                    worker_id=self.worker_id,
+                    shard_location=shard_location,
+                    original_size=original_size,
+                    encoded_size=encoded_size,
+                    message="Chunk processed and sharded successfully"
+                )
+
+            except Exception as e:
+                logging.error(f"[{self.worker_id}] Unexpected error processing chunk {chunk_index} for video '{video_id}': {e}", exc_info=True)
+                context.set_details(f"Unexpected worker error: {e}")
+                context.set_code(grpc.StatusCode.INTERNAL)
+                return replication_pb2.ProcessChunkResponse(
+                    success=False,
+                    worker_id=self.worker_id,
+                    shard_location="",
+                    original_size=original_size,
+                    encoded_size=0,
+                    message=f"Unexpected worker error: {e}"
+                )
+        finally:
+            async with self._active_tasks_lock:
+                self._active_tasks -= 1
 
     async def GetShard(self, request: replication_pb2.GetShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetShardResponse:
         """Retrieves the content of a stored shard file."""
@@ -158,6 +168,47 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                 success=False,
                 shard_data=b"",
                 message=f"Unexpected worker error: {e}"
+            )
+
+    async def CheckHealth(self, request: replication_pb2.HealthCheckRequest, context: grpc.aio.ServicerContext) -> replication_pb2.HealthCheckResponse:
+        """Handles health check requests from the master."""
+        master_id = request.master_id
+        logging.info(f"[{self.worker_id}] Received health check from master '{master_id}'")
+        
+        try:
+            # Get system metrics using psutil
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory_usage = psutil.Process(os.getpid()).memory_info().rss  # Resident Set Size in bytes
+            
+            # Get number of active tasks
+            active_tasks = 0
+            async with self._active_tasks_lock:
+                active_tasks = self._active_tasks
+                
+            # Create health check response
+            response = replication_pb2.HealthCheckResponse(
+                is_healthy=True,  # Default to healthy
+                worker_id=self.worker_id,
+                cpu_utilization=cpu_percent,
+                memory_usage_bytes=memory_usage,
+                active_tasks=active_tasks,
+                message="Worker is healthy and ready to process tasks"
+            )
+            
+            # Log health status
+            logging.info(f"[{self.worker_id}] Health check completed: CPU: {cpu_percent}%, Memory: {memory_usage} bytes, Active tasks: {active_tasks}")
+            
+            return response
+            
+        except Exception as e:
+            logging.error(f"[{self.worker_id}] Error during health check: {e}", exc_info=True)
+            return replication_pb2.HealthCheckResponse(
+                is_healthy=False,
+                worker_id=self.worker_id,
+                cpu_utilization=0.0,
+                memory_usage_bytes=0,
+                active_tasks=0,
+                message=f"Health check failed: {str(e)}"
             )
 
 

@@ -21,6 +21,8 @@ service VideoProcessingService {
   rpc ProcessChunk (ProcessChunkRequest) returns (ProcessChunkResponse);
   // RPC for client/master to retrieve a processed shard file from a worker
   rpc GetShard (GetShardRequest) returns (GetShardResponse);
+  // RPC for master to check health of worker nodes
+  rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
 }
 
 // --- Client Requests/Responses (Existing) ---
@@ -121,4 +123,19 @@ message GetShardResponse {
   bool success = 1;
   bytes shard_data = 2; // The binary content of the shard file
   string message = 3; // Status or error message
+}
+
+// --- Health Check Messages (New) ---
+
+message HealthCheckRequest {
+  string master_id = 1; // Identifier of the master requesting the health check
+}
+
+message HealthCheckResponse {
+  bool is_healthy = 1; // Whether the worker is healthy
+  string worker_id = 2; // Identifier of the worker responding
+  float cpu_utilization = 3; // Current CPU utilization (0-100)
+  int64 memory_usage_bytes = 4; // Current memory usage in bytes
+  int32 active_tasks = 5; // Number of tasks currently being processed
+  string message = 6; // Additional health information or error message
 }
