@@ -1,4 +1,4 @@
-## Project Components
+## Worker Node Components 
 
 - `worker.py`: Implements the Video Processing Worker service. It listens for incoming video chunks, processes them, and stores them.
 
@@ -7,6 +7,10 @@
 - `video_processing.proto`: Defines the gRPC service (`VideoProcessingService`) and the message structures used for communication between the Master (test client) and the Worker.
 
 - `setup_env.sh`: A convenience script to set up a Python virtual environment, install dependencies, and compile _only_ the `video_processing.proto` file.
+
+- `test_health_check.py`: A tool that simulates a master node monitoring the health of worker nodes using the CheckHealth RPC.
+
+- `healthCheck.md`: Detailed documentation about the worker health check system, including guidance for master node implementation.
 
 ## Setup and Installation
 
@@ -85,53 +89,11 @@ The test client simulates a Master sending video chunks to a worker and retrievi
 
 - Verify Shard Content (Optional): While the simulated encoding doesn't produce a standard video format, you can inspect the retrieved `.shard` files. Their size should be smaller than the original chunks. You can also try concatenating them (`cat retrieved_shards/*.shard > reconstructed.bin`) and attempting to open the `reconstructed.bin` file with a tolerant player like VLC, although it's unlikely to play correctly due to the simulated encoding.
 
+## Worker Health Monitoring
 
+The system includes a health check mechanism that allows the master to monitor the health and status of worker nodes.
 
-
-## Health Check Features
-
-- **CheckHealth RPC**: A gRPC endpoint that allows the master to query a worker's health status.
-- **System Metrics**: The worker reports CPU utilization, memory usage, and the number of active tasks.
-- **Fault Detection**: The master maintains a list of active workers and marks unresponsive ones as "down".
-- **Threshold-Based Marking**: Workers are marked as unhealthy after multiple consecutive failed checks.
-
-## How It Works
-
-1. The master periodically calls the `CheckHealth` RPC on each registered worker.
-2. Each worker responds with its health status and system metrics.
-3. The master maintains a health status table for all workers.
-4. Workers that fail to respond or report unhealthy status are marked as "down" after reaching the unhealthy threshold.
-
-## Testing Health Checks
-
-You can test the health monitoring functionality by:
-
-1. Starting one or more worker instances:
-   ```bash
-   ./start_worker.sh --port=50061
-   ./start_worker.sh --port=50062
-   ```
-
-2. Running the health check monitor:
-   ```bash
-   ./start_health_checker.sh --master_id=master-1
-   ```
-
-The health checker will display a status table showing all workers' health and performance metrics.
-
-## Health Monitor Output
-
-The health monitor displays a table with the following information:
-
-- Worker Address
-- Health Status (HEALTHY or DOWN)
-- CPU Utilization (%)
-- Memory Usage (MB)
-- Active Tasks
-- Latency (ms)
-- Last Seen Time
-
-
+Refer healthCheck.md 
 
 ## Further Development
 
