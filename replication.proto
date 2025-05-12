@@ -36,12 +36,15 @@ service NodeService {
 // The first message in the stream will contain metadata and the first chunk.
 // Subsequent messages will contain only data chunks.
 message UploadVideoChunk {
-  string video_id = 1; // Include video_id in every chunk for robustness
-  bytes data_chunk = 2;
-  int32 target_width = 3; // Include in first chunk
-  int32 target_height = 4; // Include in first chunk
-  string original_filename = 5; // Include in first chunk
-  bool is_first_chunk = 6; // Indicate if this is the first message (contains metadata)
+  string   video_id           = 1;
+  bytes    data_chunk         = 2;
+  bool     is_first_chunk     = 3;
+  int32    target_width       = 4;  // existing
+  int32    target_height      = 5;  // existing
+  int32    upscale_width      = 6;  // new
+  int32    upscale_height     = 7;  // new
+  string   output_format      = 8;  // new, e.g. "mp4", "mkv", "webm"
+  string   original_filename  = 9;
 }
 
 

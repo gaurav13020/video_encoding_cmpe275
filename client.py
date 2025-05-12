@@ -12,7 +12,16 @@ from tqdm.asyncio import tqdm  # Import tqdm for the progress bar
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
-async def upload_video(master_address: str, video_path: str, target_width: int, target_height: int):
+async def upload_video(
+
+master_address: str,
+video_path: str,
+target_width: int,
+target_height: int,
+upscale_width: int,
+upscale_height: int,
+output_format: str
+):
     """Uploads a video file to the master node using streaming."""
     print(
         f"--- Uploading Video '{os.path.basename(video_path)}' ({video_path}) to Master ({master_address}) ---")
@@ -24,78 +33,70 @@ async def upload_video(master_address: str, video_path: str, target_width: int, 
 
     async def generate_chunks():
         """Reads the video file in chunks and yields UploadVideoChunk messages."""
+        first = True
         try:
             with open(video_path, 'rb') as f:
-                is_first = True
                 while True:
                     chunk = f.read(CHUNK_SIZE)
                     if not chunk:
-                        break  # End of file
+                        break
 
-                    # The first chunk includes metadata
-                    if is_first:
-                        print(
-                            f"Sending first chunk with metadata for video ID: {video_id}")
+                    # Show you’re sending each chunk
+                    print(f"chunk client size: {len(chunk)} bytes", flush=True)
+
+                    if first:
                         yield replication_pb2.UploadVideoChunk(
                             video_id=video_id,
                             data_chunk=chunk,
                             target_width=target_width,
                             target_height=target_height,
-                            original_filename=original_filename,
+                            upscale_width=upscale_width,
+                            upscale_height=upscale_height,
+                            output_format=output_format,
+                            original_filename=video_id,
                             is_first_chunk=True
                         )
-                        is_first = False
+                        first = False
                     else:
+                        # Subsequent chunks: still include video_id
                         yield replication_pb2.UploadVideoChunk(
                             video_id=video_id,
                             data_chunk=chunk,
-                            is_first_chunk=False  # Not the first chunk
+                            is_first_chunk=False
                         )
 
         except FileNotFoundError:
-            print(f"Error: Video file not found at {video_path}")
-
-            return  # Exit the generator
+            print(f"Error: Video file not found at {video_path}", flush=True)
         except Exception as e:
-            print(f"An error occurred while reading video file: {e}")
-            return  # Exit the generator
+            print(f"Error reading video file: {e}", flush=True)
 
     # Set max message size for the channel to handle potential large chunks, though streaming
-    channel_options = [
-        # Allow chunk size + some overhead
+    options = [
         ('grpc.max_send_message_length', CHUNK_SIZE + 1024),
         ('grpc.max_receive_message_length', CHUNK_SIZE + 1024),
     ]
-    async with grpc.aio.insecure_channel(master_address, options=channel_options) as channel:
+    async with grpc.aio.insecure_channel(master_address, options=options) as channel:
         stub = replication_pb2_grpc.MasterServiceStub(channel)
 
-        print("Sending UploadVideo stream...")
-        start_time = time.monotonic()
+        print("Starting UploadVideo RPC...", flush=True)
+        start = time.monotonic()
         try:
-            # Call the streaming RPC with the async generator
             response = await stub.UploadVideo(generate_chunks())
-            end_time = time.monotonic()
-            rpc_time = (end_time - start_time) * 1000  # in ms
+            elapsed = (time.monotonic() - start) * 1000
+            print(f"RPC completed in {elapsed:.0f} ms", flush=True)
 
-            print("--- UploadVideo Response ---")
-            print(f"Success: {response.success}")
-            print(f"Video ID: {response.video_id}")
-            print(f"Message: {response.message}")
-            print(f"RPC Time Taken: {rpc_time:.2f} ms")
-
+            print(f"→ success={response.success}, video_id={response.video_id}", flush=True)
             if response.success:
-                print(f"Video '{response.video_id}' uploaded successfully.")
                 return response.video_id
             else:
-                print(f"Video upload failed: {response.message}")
+                print("Server reported failure:", response.message, flush=True)
                 return None
 
-        except grpc.aio.AioRpcError as e:
-            print(
-                f"RPC failed during upload stream: {e.code()} - {e.details()}")
+        except grpc.aio.AioRpcError as rpc_e:
+            print(f"gRPC error: {rpc_e.code()} — {rpc_e.details()}", flush=True)
             return None
         except Exception as e:
-            print(f"An unexpected error occurred during upload stream: {e}")
+            print(f"Unexpected error during upload: {e}", flush=True)
             return None
 
 
@@ -204,6 +205,12 @@ async def main():
                         help="Target width for video encoding")
     parser.add_argument("--height", type=int, default=480,
                         help="Target height for video encoding")
+    parser.add_argument("--upscale-width",  type=int,
+                        help="Upscale width for output shards")
+    parser.add_argument("--upscale-height", type=int,
+                        help="Upscale height for output shards")
+    parser.add_argument("--format", dest="format", default="mp4",
+                        help="Output container format for shards (mp4,mkv,webm,...)")
     parser.add_argument("--status", type=str,
                         help="Video ID to get status for")
     parser.add_argument("--poll-interval", type=int, default=5,
@@ -214,7 +221,18 @@ async def main():
     args = parser.parse_args()
 
     if args.upload:
-        video_id = await upload_video(args.master, args.upload, args.width, args.height)
+        # Pass new upscale and format args (fallback to target dims if not supplied)
+        uw = args.upscale_width  if args.upscale_width  else args.width
+        uh = args.upscale_height if args.upscale_height else args.height
+        video_id = await upload_video(
+            args.master,
+            args.upload,
+            args.width,
+            args.height,
+            uw,
+            uh,
+            args.format
+        )
         if video_id:
             # Changed message
             print(f"\nVideo upload initiated with ID: {video_id}")
