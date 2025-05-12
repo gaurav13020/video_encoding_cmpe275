@@ -10,6 +10,9 @@ import random # For jitter or random selection if needed, not used in current si
 import replication_pb2
 import replication_pb2_grpc
 
+import client_master_pb2
+import client_master_pb2_grpc
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Configuration for the Master
@@ -21,6 +24,7 @@ MASTER_ID = "master-load-balancer-01"
 # Structure: { "worker_address": {"healthy": bool, "active_tasks": int, "cpu_utilization": float, "last_seen": float, "failed_checks": int} }
 worker_status_map = {}
 worker_status_lock = asyncio.Lock() # To protect concurrent access to worker_status_map
+worker_addresses: list[str] = []
 
 async def get_worker_health(worker_address):
     """Fetches health status from a single worker."""
@@ -175,19 +179,66 @@ async def distribute_video_to_workers(video_path, worker_addresses):
     logging.info(f"Finished distributing video '{video_id}'. Processed {chunk_index} chunks.")
     return results
 
+async def serve_ingestion(port: int = 50050):
+    server = grpc.aio.server()
+    client_master_pb2_grpc.add_ClientUploadServiceServicer_to_server(
+        ClientUploadService(), server
+    )
+    listen = f"[::]:{port}"
+    server.add_insecure_port(listen)
+    logging.info(f"Starting ingestion gRPC server on {listen}")
+    await server.start()
+    await server.wait_for_termination()
+
+class ClientUploadService(client_master_pb2_grpc.ClientUploadServiceServicer):
+    async def UploadVideo(self, request_iterator, context):
+        # write incoming chunks to disk
+        try:
+            video_name = None
+            async for chunk in request_iterator:
+                if video_name is None:
+                    video_name = chunk.video_name
+                    fh = open(video_name, "wb")
+                fh.write(chunk.data)
+            fh.close()
+            logging.info(f"Saved upload as '{video_name}'")
+            # now kick off your existing distribution pipeline
+            # note: worker_addresses comes from CLI args parsed in main()
+            await distribute_video_to_workers(video_name, worker_addresses)
+            return client_master_pb2.UploadResponse(
+                success=True,
+                message=f"Upload and distribution of '{video_name}' complete"
+            )
+        except Exception as e:
+            logging.error(f"Error in UploadVideo: {e}", exc_info=True)
+            return client_master_pb2.UploadResponse(
+                success=False,
+                message=str(e)
+            )
+
 async def main():
     global CHUNK_SIZE # Moved global declaration to the top of the function
 
-    parser = argparse.ArgumentParser(description="Master process for distributing video chunks to workers (load-aware).")
-    parser.add_argument('--video_path', type=str, required=True, help='Path to the video file to be processed.')
+    parser = argparse.ArgumentParser(description="Master process for distributing video chunks to workers (load-aware) or serving ingestion.")
+    parser.add_argument('--video_path', type=str, required=False, help='[Required unless --serve] Path to the video file to be processed.')
     parser.add_argument('--workers', type=str, required=True, help='Comma-separated list of worker addresses (e.g., localhost:50061,localhost:50062).')
     parser.add_argument('--chunk_size', type=int, default=CHUNK_SIZE, help=f'Size of each chunk in bytes (default: {CHUNK_SIZE}).')
+    parser.add_argument('--serve', action='store_true', help='Start gRPC ingestion server instead of local-file mode')
 
     args = parser.parse_args()
 
+    if not args.serve and not args.video_path:
+        parser.error("--video_path is required unless --serve is specified")
+
     CHUNK_SIZE = args.chunk_size # This now correctly modifies the global CHUNK_SIZE
 
+    global worker_addresses
     worker_addresses = [addr.strip() for addr in args.workers.split(',') if addr.strip()]
+
+    if args.serve:
+        # ignore --video_path, just host ingestion endpoint
+        await serve_ingestion()
+        return
 
     if not worker_addresses:
         print("No worker addresses provided. Exiting.")

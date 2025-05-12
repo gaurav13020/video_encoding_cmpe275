@@ -25,6 +25,8 @@ htmlcov/
 replication_pb2.py
 replication_pb2_grpc.py
 replication_pb2.pyi
+client_master_pb2.py
+client_master_pb2_grpc.py
 
 # Generated video shard directories
 video_shards/
