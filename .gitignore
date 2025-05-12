@@ -31,10 +31,12 @@ video_shards/
 retrieved_shards/
 
 # Example generated test video
-test_video*.mp4
+*.mp4
 # Add other test video filenames if you create them
 
 # OS generated files
 .DS_Store
 .localized
 Thumbs.db
+
+master_data/

@@ -1,12 +1,12 @@
-
 # Video Encoding for CMPE275
+
 Class Project for Distributed Video Encoding for SJSU CMPE 275
 
 # ISSUES
 
-Todo items are listed in Issues. Please contact Ignol in discord server for issue assignments. 
+Todo items are listed in Issues. Please contact Ignol in discord server for issue assignments.
 
-If there is a * next to the issue, that means it's a desired but not essential feature.
+If there is a \* next to the issue, that means it's a desired but not essential feature.
 
 # Video Processing Worker Guide
 
@@ -21,6 +21,10 @@ This project implements a standalone Video Processing Worker using gRPC in Pytho
 - `video_processing.proto`: Defines the gRPC service (`VideoProcessingService`) and the message structures used for communication between the Master (test client) and the Worker.
 
 - `setup_env.sh`: A convenience script to set up a Python virtual environment, install dependencies, and compile _only_ the `video_processing.proto` file.
+
+- `test_health_check.py`: A tool that simulates a master node monitoring the health of worker nodes using the CheckHealth RPC.
+
+- `healthCheck.md`: Detailed documentation about the worker health check system, including guidance for master node implementation.
 
 ## Setup and Installation
 
@@ -99,11 +103,23 @@ The test client simulates a Master sending video chunks to a worker and retrievi
 
 - Verify Shard Content (Optional): While the simulated encoding doesn't produce a standard video format, you can inspect the retrieved `.shard` files. Their size should be smaller than the original chunks. You can also try concatenating them (`cat retrieved_shards/*.shard > reconstructed.bin`) and attempting to open the `reconstructed.bin` file with a tolerant player like VLC, although it's unlikely to play correctly due to the simulated encoding.
 
+## Worker Health Monitoring
+
+The system includes a health check mechanism that allows the master to monitor the health and status of worker nodes.
+
+Refer healthCheck.md
+
 ## Further Development
 
 - Integrate a real video encoding library (like `ffmpeg`) into the `worker.py`'s `ProcessChunk` method to produce actual encoded video segments.
 
 - Develop a Master process that handles client video uploads, chunks the video, selects workers (potentially using a load balancing or simple adaptive strategy for workers), sends chunks, and manages the metadata of the stored shards.
 
+<<<<<<< HEAD
+
 - Implement a mechanism for the Master to reconstruct the full video from the stored shards based on client requests.
 
+=======
+
+- Implement a mechanism for the Master to reconstruct the full video from the stored shards based on client requests.
+  > > > > > > > 7e02972 (first all in one draft)
