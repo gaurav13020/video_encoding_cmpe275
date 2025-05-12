@@ -1,125 +1,169 @@
-# Video Encoding for CMPE275
+# Distributed Video Encoding System
 
-Class Project for Distributed Video Encoding for SJSU CMPE 275
+This project implements a basic distributed system for uploading, processing (encoding/resizing), and retrieving video files using gRPC. The system consists of a master node that manages tasks and worker nodes that perform the actual video processing.
 
-# ISSUES
+## Components
 
-Todo items are listed in Issues. Please contact Ignol in discord server for issue assignments.
+- **`replication.proto`**: Defines the gRPC services and message structures used for communication between the client, master node, and worker nodes.
+- **`node.py`**: Implements the core logic for both the master and worker roles. A single instance of `node.py` can run as either a master or a worker.
+  - **Master Role**: Handles client requests (upload, retrieve, status), segments large videos, distributes processing tasks to workers, collects processed shards, and concatenates them into the final output video. It also includes basic node discovery and election-related RPCs (though the full consensus logic might not be fully implemented).
+  - **Worker Role**: Receives video shards from the master, processes them (e.g., resizing using FFmpeg), and provides the processed shards back to the master upon request.
+- **`client.py`**: A command-line client application that interacts with the master node to upload videos for processing, check the status of processing tasks, and retrieve the final processed video. It includes a progress bar for video retrieval using `tqdm`.
 
-If there is a \* next to the issue, that means it's a desired but not essential feature.
+## Features
 
-# Video Processing Worker Guide
+- **Video Upload**: Clients can upload video files to the master node.
+- **Distributed Processing**: The master distributes video processing tasks (on segmented video shards) to available worker nodes.
+- **Video Retrieval**: Clients can retrieve the processed video from the master once the processing is complete.
+- **Processing Status**: Clients can query the status of their video processing tasks.
+- **Basic Node Roles**: Supports running nodes as either a master or a worker.
+- **gRPC Streaming**: Uses gRPC for efficient streaming of video data during upload and retrieval.
+- **Download Progress Bar**: The client shows a progress bar during video retrieval.
 
-This project implements a standalone Video Processing Worker using gRPC in Python. It's designed to receive video chunks from a Master process (simulated by the test client), simulate encoding them to make them smaller, and store them as local shards. It also provides an RPC to retrieve the stored shard files.
+## Prerequisites
 
-## Project Components
+- Python 3.7+
+- `pip` package installer
+- FFmpeg installed and accessible in the system's PATH on both master and worker nodes (used for video segmentation, processing, and concatenation).
+- `grpcio` and `protobuf` Python packages.
+- `tqdm` Python package (for the client progress bar).
+- `psutil` Python package (for node stats).
+- `ffmpeg-python` Python package (a Python wrapper for FFmpeg).
 
-- `worker.py`: Implements the Video Processing Worker service. It listens for incoming video chunks, processes them, and stores them.
+## Setup
 
-- `test_worker_client.py`: A client script to test the video processing worker. It can read a video file, chunk it, send chunks to a worker, and retrieve the processed shards.
+1.  **Install Dependencies**:
 
-- `video_processing.proto`: Defines the gRPC service (`VideoProcessingService`) and the message structures used for communication between the Master (test client) and the Worker.
-
-- `setup_env.sh`: A convenience script to set up a Python virtual environment, install dependencies, and compile _only_ the `video_processing.proto` file.
-
-- `test_health_check.py`: A tool that simulates a master node monitoring the health of worker nodes using the CheckHealth RPC.
-
-- `healthCheck.md`: Detailed documentation about the worker health check system, including guidance for master node implementation.
-
-## Setup and Installation
-
-1.  Clone or download the project files: Ensure you have the Python scripts (`worker.py`, `test_worker_client.py`), the Protobuf definition file (`video_processing.proto`), and the setup script (`setup_env.sh`) in the same directory.
-
-2.  Make the setup script executable:
-
-    ```
-    chmod +x ./setup_env.sh
-
-    ```
-
-3.  Run the setup and compile script: This script will create a Python virtual environment (`venv`), install all necessary libraries (`grpcio`, `protobuf`, `grpcio-tools`), and compile your `video_processing.proto` file.
+    Bash
 
     ```
-    ./setup_env.sh
+    pip install grpcio protobuf grpcio-tools tqdm psutil ffmpeg-python
 
     ```
 
-4.  Activate the virtual environment: After running the script, your current terminal session should have the virtual environment activated. If you open a new terminal, you'll need to activate it manually:
+2.  **Install FFmpeg**: Ensure FFmpeg is installed on your system and available in the PATH. You can usually install it via your system's package manager (e.g., `sudo apt-get install ffmpeg` on Debian/Ubuntu, `brew install ffmpeg` on macOS).
+
+3.  **Compile the `.proto` file**: Generate the Python gRPC code from the `replication.proto` file.
+
+    Bash
 
     ```
-    source ./venv/bin/activate
+    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. replication.proto
 
     ```
 
-    You should see `(venv)` at the start of your terminal prompt, indicating the environment is active.
-
-5.  Verify Protobuf Compilation: Check that `video_processing_pb2.py`, `video_processing_pb2_grpc.py`, and `video_processing_pb2.pyi` files have been created in your project directory. If the `setup_env.sh` script reported compilation errors, fix the issues in `video_processing.proto` and re-run the script.
+    This will generate `replication_pb2.py` and `replication_pb2_grpc.py` in the same directory.
 
 ## Running the System
 
-Make sure your virtual environment is activated in each terminal session where you run a component.
+You need to start one node as the master and one or more nodes as workers.
 
-### 1\. Start the Video Processing Worker (`worker.py`)
+1.  **Start the Master Node**:
 
-Run one or more instances of `worker.py`. Each worker needs a host and port to listen on.
+    Bash
 
-Example (running a worker on port 50061):
+    ```
+    python node.py --host <master_host> --port <master_port> --role master
+
+    ```
+
+    Replace `<master_host>` and `<master_port>` with the IP address/hostname and port the master should listen on.
+
+2.  **Start Worker Nodes**:
+
+    Bash
+
+    ```
+    python node.py --host <worker_host> --port <worker_port> --role worker --master <master_host>:<master_port> --nodes <master_host>:<master_port>,<other_worker_host>:<other_worker_port>,...
+
+    ```
+
+    Replace `<worker_host>` and `<worker_port>` with the worker's address. Replace `<master_host>:<master_port>` with the address of the running master node. The `--nodes` argument should be a comma-separated list of known node addresses, including the master and other workers. This helps nodes discover each other.
+
+    _Example (Master on localhost:50051, Worker on localhost:50052)_:
+
+    - Start Master: `python node.py --host localhost --port 50051 --role master`
+    - Start Worker: `python node.py --host localhost --port 50052 --role worker --master localhost:50051 --nodes localhost:50051,localhost:50052`
+
+## Using the Client
+
+The `client.py` script provides commands for interacting with the master node.
+
+Bash
 
 ```
-source ./venv/bin/activate
-python worker.py --host localhost --port 50061
+python client.py --master <master_host>:<master_port> [command] [options]
 
 ```
 
-### 2\. Use the Test Client (`test_worker_client.py`)
+- `<master_host>:<master_port>`: The address of the master node.
 
-The test client simulates a Master sending video chunks to a worker and retrieving the processed shards. You'll need a video file for testing.
+**Commands:**
 
-- Create a Test Video File (Optional): If you don't have a small video file, you can create one using `ffmpeg` (install `ffmpeg` if you don't have it):
+- **Upload a video**:
 
-  ```
-  # Example using ffmpeg to create a dummy video
-  ffmpeg -f lavfi -i testsrc=duration=5:size=320x240:rate=15 -f lavfi -i sine=duration=5:frequency=220 -c:v libx264 -c:a aac -strict experimental -shortest test_video_small.mp4
+  Bash
 
   ```
-
-- Run the Test Client: Specify the worker's address, the path to your video file, the chunk size, and an output directory for retrieved shards.
-
-  ```
-  source ./venv/bin/activate
-  python test_worker_client.py --worker localhost:50061 --video_path ./test_video_small.mp4 --chunk_size 524288 --output_dir ./retrieved_shards
+  python client.py --master <master_address> --upload <path_to_video_file> --width <target_width> --height <target_height> [--output <output_path_for_retrieval>]
 
   ```
 
-  (Adjust `--worker`, `--video_path`, `--chunk_size` (e.g., 524288 for 512KB), and `--output_dir` as needed).
+  - `--upload`: Path to the local video file to upload.
+  - `--width`: Target width for the processed video.
+  - `--height`: Target height for the processed video.
+  - `--output`: (Optional) If specified, the client will automatically poll for the video status after upload and retrieve the processed video to this path when complete.
 
-## Testing and Verification
+- **Retrieve a processed video**:
 
-- Worker Logs: Check the terminal where you ran `worker.py`. You should see logs indicating that it received chunks, simulated encoding, and stored shards in the `video_shards` directory (created in the same directory as `worker.py`).
+  Bash
 
-- Client Output: The `test_worker_client.py` output will show the progress of sending chunks and retrieving shards. Look for "Chunk X processed successfully" and "Successfully retrieved and saved shard data".
+  ```
+  python client.py --master <master_address> --retrieve <video_id> --output <output_path>
 
-- Retrieved Shards: Check the directory specified by `--output_dir` (e.g., `./retrieved_shards`). You should find files corresponding to the encoded chunks (e.g., `test_video_small.mp4_chunk_0.shard`, `test_video_small.mp4_chunk_1.shard`).
+  ```
 
-- Verify Shard Content (Optional): While the simulated encoding doesn't produce a standard video format, you can inspect the retrieved `.shard` files. Their size should be smaller than the original chunks. You can also try concatenating them (`cat retrieved_shards/*.shard > reconstructed.bin`) and attempting to open the `reconstructed.bin` file with a tolerant player like VLC, although it's unlikely to play correctly due to the simulated encoding.
+  - `--retrieve`: The ID of the video to retrieve (obtained from the upload response).
+  - `--output`: The local path where the retrieved video will be saved.
 
-## Worker Health Monitoring
+- **Get video processing status**:
 
-The system includes a health check mechanism that allows the master to monitor the health and status of worker nodes.
+  Bash
 
-Refer healthCheck.md
+  ```
+  python client.py --master <master_address> --status <video_id>
 
-## Further Development
+  ```
 
-- Integrate a real video encoding library (like `ffmpeg`) into the `worker.py`'s `ProcessChunk` method to produce actual encoded video segments.
+  - `--status`: The ID of the video to check the status for.
 
-- Develop a Master process that handles client video uploads, chunks the video, selects workers (potentially using a load balancing or simple adaptive strategy for workers), sends chunks, and manages the metadata of the stored shards.
+## gRPC Services and Messages
 
-<<<<<<< HEAD
+The `replication.proto` file defines the following services:
 
-- Implement a mechanism for the Master to reconstruct the full video from the stored shards based on client requests.
+- **`MasterService`**: RPCs for client-master interaction and master-side operations.
+  - `UploadVideo`: Client streams video chunks to the master.
+  - `RetrieveVideo`: Master streams processed video chunks to the client.
+  - `GetVideoStatus`: Client requests the processing status of a video.
+  - `ReportWorkerShardStatus`: Workers report the status of processed shards to the master.
+- **`WorkerService`**: RPCs for master-worker interaction related to shard processing.
+  - `ProcessShard`: Master sends a video shard to a worker for processing.
+  - `RequestShard`: Master requests a processed shard back from a worker.
+- **`NodeService`**: RPCs for inter-node communication (e.g., discovery, leader election - though election logic might be simplified or a placeholder).
+  - `AnnounceMaster`: Nodes announce the current master.
+  - `RequestVote`: Nodes request votes during an election.
+  - `GetNodeStats`: Get resource usage and status statistics from a node.
+  - `GetCurrentMaster`: Clients or other nodes can discover the current master's address.
 
-=======
+The `.proto` file also defines various message structures used by these RPCs to carry data like video chunks, status information, shard details, and node statistics.
 
-- Implement a mechanism for the Master to reconstruct the full video from the stored shards based on client requests.
-  > > > > > > > 7e02972 (first all in one draft)
+## Limitations and Future Improvements
+
+- **No Real-time Streaming**: The current system downloads the entire processed video file before playback can begin. It does not support real-time adaptive streaming like HLS or DASH. Implementing this would require significant architectural changes, including video segmentation on the server and a dedicated streaming client/player.
+- **Simplified Consensus**: The node discovery and leader election RPCs (`NodeService`) are defined, but the full, robust consensus algorithm (like Raft or Paxos) is likely not fully implemented in `node.py`. A production system would require a more complete and fault-tolerant consensus mechanism.
+- **Error Handling and Resilience**: While some basic error handling is present, a production system would need more comprehensive error handling, retry mechanisms, and strategies for handling node failures gracefully.
+- **Scalability**: The current master might become a bottleneck with a very large number of videos or workers. Further scalability improvements could involve partitioning the master's responsibilities or using a distributed queue.
+- **Security**: The current implementation uses insecure gRPC channels. For production, secure channels with authentication and encryption would be necessary.
+- **Monitoring and Logging**: More detailed logging and monitoring would be beneficial for debugging and operating the system.
+- **Configuration Management**: Using configuration files instead of command-line arguments for complex deployments would be more manageable.
+- **Video Format Support**: FFmpeg provides broad support, but ensuring compatibility and handling various codecs and containers robustly is important.

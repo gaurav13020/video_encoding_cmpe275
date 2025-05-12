@@ -34,7 +34,7 @@ logging.info(f"Ensured master retrieved shards directory exists at: {os.path.abs
 
 STREAM_CHUNK_SIZE = 1024 * 1024
 
-MAX_GRPC_MESSAGE_LENGTH = 100 * 1024 * 1024
+MAX_GRPC_MESSAGE_LENGTH = 1024 * 1024 * 1024  # 1gb
 
 class Node:
     def __init__(self, host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
