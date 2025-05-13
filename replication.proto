@@ -13,15 +13,6 @@ service MasterService {
   rpc ReportWorkerShardStatus (ReportWorkerShardStatusRequest) returns (ReportWorkerShardStatusResponse);
 }
 
-// Service definition for video processing workers
-service VideoProcessingService {
-  // RPC for master to send a video chunk to a worker for processing
-  rpc ProcessChunk (ProcessChunkRequest) returns (ProcessChunkResponse);
-  // RPC for client/master to retrieve a processed shard file from a worker
-  rpc GetShard (GetShardRequest) returns (GetShardResponse);
-  // RPC for master to check health of worker nodes
-  rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
-  
 // Service for master-worker interactions (processing video shards)
 service WorkerService {
   // Master sends shard to worker for processing (e.g., resizing)
@@ -188,19 +179,4 @@ message GetCurrentMasterResponse {
     string master_address = 1; // The address of the current master
     int32 term = 2; // The current term of the master
     bool is_master_known = 3; // Indicates if this node knows who the master is
-}
-
-// --- Health Check Messages (New) ---
-
-message HealthCheckRequest {
-  string master_id = 1; // Identifier of the master requesting the health check
-}
-
-message HealthCheckResponse {
-  bool is_healthy = 1; // Whether the worker is healthy
-  string worker_id = 2; // Identifier of the worker responding
-  float cpu_utilization = 3; // Current CPU utilization (0-100)
-  int64 memory_usage_bytes = 4; // Current memory usage in bytes
-  int32 active_tasks = 5; // Number of tasks currently being processed
-  string message = 6; // Additional health information or error message
 }
