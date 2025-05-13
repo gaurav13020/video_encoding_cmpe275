@@ -800,7 +800,7 @@ class Node:
                     )
 
                     logging.info(f"[{self.address}] Sending shard {shard_id} ({len(shard_data)} bytes) to worker {worker_address}")
-                    response = await asyncio.wait_for(worker_stub.ProcessShard(request), timeout=30)
+                    response = await asyncio.wait_for(worker_stub.ProcessShard(request), timeout=30000)
 
                     if response.success:
                          logging.info(f"[{self.address}] Worker {worker_address} accepted shard {shard_id} for processing.")
