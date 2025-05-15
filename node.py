@@ -97,8 +97,11 @@ class Node:
                 self._create_stubs_for_node(node_addr)
 
         if self.role == 'worker' and self.current_master_address:
-             logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
-             self._create_master_stubs(self.current_master_address)
+            logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
+            self._create_master_stubs(self.current_master_address)
+
+            # let master know we exist
+            asyncio.create_task(self._register_with_master())
 
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
@@ -154,7 +157,6 @@ class Node:
         self.master_stub = replication_pb2_grpc.MasterServiceStub(self._master_channel)
         logging.info(f"[{self.address}] MasterService stub updated for {master_address}")
 
-
     def _get_or_create_master_stub(self) -> Optional[replication_pb2_grpc.MasterServiceStub]:
         """Returns the MasterService stub for the current master."""
         current_master_address = self.current_master_address
@@ -162,7 +164,15 @@ class Node:
              return None
         self._create_master_stubs(current_master_address)
         return self.master_stub
-
+    
+    
+    async def _register_with_master(self):
+        try:
+            req  = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
+            resp = await self.master_stub.RegisterWorker(req)
+            logging.info(f"[{self.address}] Registered with master: {resp.message}")
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to register with master: {e}")
 
     async def start(self):
         """Starts the gRPC server and background routines."""
@@ -175,6 +185,19 @@ class Node:
         replication_pb2_grpc.NodeServiceServicer.__init__(self)
         self._server.add_insecure_port(self.address)
         replication_pb2_grpc.add_NodeServiceServicer_to_server(self, self._server)
+
+        # —————————————————————————————————————————————————————————————————
+        # Always register both Master + Worker service implementations
+        replication_pb2_grpc.MasterServiceServicer.__init__(self)
+        replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
+        self._master_service_added = True
+        logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+
+        replication_pb2_grpc.WorkerServiceServicer.__init__(self)
+        replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
+        self._worker_service_added = True
+        logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
+        # —————————————————————————————————————————————————————————————————
 
         # Add WorkerService unconditionally if the initial role is worker
         if self.role == 'worker':
@@ -233,45 +256,39 @@ class Node:
 
 
         else:
-             logging.info(f"[{self.address}] No active master found with term >= my current term during startup discovery. Proceeding with initial role.")
-             if self.role == 'master':
-                 replication_pb2_grpc.MasterServiceServicer.__init__(self)
-                 replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
-                 self._master_service_added = True
-                 logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+            logging.info(f"[{self.address}] No active master found with term >= my current term during startup discovery. Proceeding with initial role.")
 
-                 # Master also needs WorkerService to receive processed shards from workers
-                 if not self._worker_service_added: # Check if already added if started as worker and became master
-                     replication_pb2_grpc.WorkerServiceServicer.__init__(self)
-                     replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
-                     self._worker_service_added = True
-                     logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
+            # 1) register _both_ gRPC services on every node
+            replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
+            logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+            replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
+            logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
+            # 2) now kick off role‐specific background tasks
+            if self.role == 'master':
+                logging.info(f"[{self.address}] Initializing worker stubs based on known nodes.")
+                self._worker_stubs = {}
+                for node_addr in self.known_nodes:
+                    if node_addr != self.address:
+                        self._create_stubs_for_node(node_addr)
 
-                 logging.info(f"[{self.address}] Initializing worker stubs based on known nodes.")
-                 self._worker_stubs = {}
-                 for node_addr in self.known_nodes:
-                     if node_addr != self.address:
-                         self._create_stubs_for_node(node_addr)
+                logging.info(f"[{self.address}] Starting master announcement routine.")
+                t1 = asyncio.create_task(self._master_election_announcement_routine())
+                self._background_tasks.append(t1)
+                t2 = asyncio.create_task(self._check_other_nodes_health())
+                self._background_tasks.append(t2)
 
-                 logging.info(f"[{self.address}] Starting master announcement routine.")
-                 self._master_announcement_task = asyncio.create_task(self._master_election_announcement_routine())
-                 self._background_tasks.append(self._master_announcement_task)
-                 self._other_nodes_health_check_task = asyncio.create_task(self._check_other_nodes_health())
-                 self._background_tasks.append(self._other_nodes_health_check_task)
+            elif self.role == 'worker':
+                logging.info(f"[{self.address}] Starting worker health check routine.")
+                t = asyncio.create_task(self.check_master_health())
+                self._background_tasks.append(t)
 
+        logging.info(
+            f"[{self.address}] Node is now running with state: {self.state}, "
+            f"role: {self.role}, current_term: {self.current_term}, "
+            f"master: {self.current_master_address}"
+        )
 
-             elif self.role == 'worker':
-                 # WorkerServiceServicer is now added unconditionally above if role is worker.
-                 # Start worker health check routine.
-                 logging.info(f"[{self.address}] Starting worker health check routine.")
-                 self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                 self._background_tasks.append(self._master_health_check_task)
-
-
-        logging.info(f"[{self.address}] Node is now running with state: {self.state}, role: {self.role}, current_term: {self.current_term}, master: {self.current_master_address}")
-
-        # Wait for the server to terminate
         await self._server.wait_for_termination()
 
     async def _query_node_for_master(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> Tuple[str, bool, int]:
@@ -575,7 +592,25 @@ class Node:
             term=self.current_term,
             is_master_known=self.current_master_address is not None
         )
-
+    async def RegisterWorker(self,
+                             request: replication_pb2.RegisterWorkerRequest,
+                             context: grpc.aio.ServicerContext
+    ) -> replication_pb2.RegisterWorkerResponse:
+        """RPC called by workers at startup to join the cluster."""
+        worker_addr = request.worker_address
+        if worker_addr not in self.known_nodes:
+            logging.info(f"[{self.address}] RegisterWorker: adding {worker_addr}")
+            self.known_nodes.append(worker_addr)
+            self._create_stubs_for_node(worker_addr)
+            return replication_pb2.RegisterWorkerResponse(
+                success=True,
+                message=f"{worker_addr} registered"
+            )
+        else:
+            return replication_pb2.RegisterWorkerResponse(
+                success=False,
+                message=f"{worker_addr} was already registered"
+            )
 
     async def UploadVideo(self, request_iterator: AsyncIterator[replication_pb2.UploadVideoChunk], context: grpc.aio.ServicerContext) -> replication_pb2.UploadVideoResponse:
         """Handles video upload requests (master only)."""
@@ -1317,49 +1352,75 @@ class Node:
     
     
     async def _check_other_nodes_health(self):
-        """Periodically checks the health of other known nodes (master only)."""
-        # This task is added to _background_tasks when the role is master initially or becomes master
+        """
+        Periodically checks every known node:
+        - If we don’t yet have a stub for it, try to create one.
+        - Otherwise, call GetNodeStats() as a lightweight health‐check.
+        Works whether master or workers come up in any order.
+        """
+        # Only masters run this loop
         if self.role != 'master':
-             logging.debug(f"[{self.address}] Not a master ({self.role}), skipping other nodes health check routine.")
-             return
+            logging.debug(f"[{self.address}] Not master, skipping health checks")
+            return
 
-        health_check_interval = 5
-        jitter_range = 2
+        HEALTH_INTERVAL = 5.0      # seconds between full sweeps
+        JITTER        = 2.0        # up to this much random extra delay
+        TIMEOUT       = 3.0        # seconds per RPC
 
-        logging.info(f"[{self.address}] Starting other nodes health check routine.")
+        logging.info(f"[{self.address}] Starting other‐nodes health check routine")
 
         while True:
-             # Check if the role has changed while in the loop
-             if self.role != 'master':
-                 logging.info(f"[{self.address}] Role changed to {self.role}, stopping other nodes health check routine.")
-                 break
+            # bail out if demoted
+            if self.role != 'master':
+                logging.info(f"[{self.address}] No longer master, stopping health checks")
+                break
 
-             await asyncio.sleep(health_check_interval + random.uniform(0, jitter_range))
-
-             # Iterate through a copy of known_nodes as the list might change if nodes are added/removed
-             for node_addr in list(self.known_nodes):
-                 if node_addr == self.address:
-                     continue
-
-                 node_stub = self._node_stubs.get(node_addr)
-                 if not node_stub:
-                    logging.warning(f"[{self.address}] No NodeService stub available for {node_addr}. Cannot perform health check.")
+            for node_addr in list(self.known_nodes):
+                if node_addr == self.address:
                     continue
 
-                 try:
-                    # Attempt to get stats as a health check
+                # 1) If we never stubbed this node, try to wire it up now
+                if node_addr not in self._node_stubs:
+                    try:
+                        logging.info(f"[{self.address}] Discovered new node {node_addr}, creating stubs")
+                        self._create_stubs_for_node(node_addr)
+                        logging.info(f"[{self.address}] Stubs successfully created for {node_addr}")
+                    except Exception as e:
+                        logging.debug(f"[{self.address}] Still can’t reach {node_addr}: {e}")
+                    # move on whether it succeeded or not
+                    continue
+
+                # 2) We have a stub—do a real health check
+                stub = self._node_stubs[node_addr]
+                try:
                     await asyncio.wait_for(
-                        node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
-                        timeout=3 # seconds
+                        stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
+                        timeout=TIMEOUT
                     )
-                    logging.debug(f"[{self.address}] Node {node_addr} health check successful.")
+                    logging.debug(f"[{self.address}] Node {node_addr} is healthy")
+                except (grpc.aio.AioRpcError, asyncio.TimeoutError) as rpc_err:
+                    logging.warning(f"[{self.address}] Health check failed for {node_addr}: {rpc_err}")
+                    # Prune this node out of our cluster
+                    if node_addr in self.known_nodes:
+                        logging.info(f"[{self.address}] Removing unreachable node {node_addr} from known_nodes")
+                        self.known_nodes.remove(node_addr)
+                    # Tear down its stubs so we stop announcing to it
+                    self._node_stubs.pop(node_addr, None)
+                    self._worker_stubs.pop(node_addr, None)
+                    # *** NEW: also close and drop its channel ***
+                    if node_addr in self._channels:
+                        ch = self._channels.pop(node_addr)
+                        try:
+                            asyncio.create_task(ch.close())
+                            logging.info(f"[{self.address}] Closed channel to {node_addr}")
+                        except Exception:
+                            pass
 
-                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                    logging.warning(f"[{self.address}] Node {node_addr} health check failed: {e}. Node is potentially down.")
+                except Exception as exc:
+                    logging.error(f"[{self.address}] Unexpected error checking {node_addr}: {exc}", exc_info=True)
 
-                 except Exception as e:
-                    logging.error(f"[{self.address}] Unexpected error during health check for {node_addr}: {type(e).__name__} - {e}", exc_info=True)
-
+            # pause a bit (with jitter) before next sweep
+            await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
 
     async def _delayed_start_election(self, delay: float):
@@ -1546,9 +1607,18 @@ class Node:
             )
 
             announcement_tasks = []
-            for node_addr in self._node_stubs:
-                if node_addr != self.address:
-                    announcement_tasks.append(self._send_master_announcement(node_addr, announcement)) # Pass node_addr
+            for node_addr in list(self._node_stubs):
+                if node_addr == self.address:
+                    continue
+                try:
+                    await self._send_master_announcement(node_addr, announcement)
+                except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
+                    logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}. Removing from cluster.")
+                    # prune it
+                    self._node_stubs.pop(node_addr, None)
+                    self._worker_stubs.pop(node_addr, None)
+                    self._channels.pop(node_addr, None)
+                  
 
             if announcement_tasks:
                 await asyncio.gather(*announcement_tasks, return_exceptions=True)
