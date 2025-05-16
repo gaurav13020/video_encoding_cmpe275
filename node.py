@@ -517,7 +517,6 @@ class Node:
             
         # Vote if we haven't voted yet in this term or already voted for this candidate
         if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
-            my_score = self.calculate_server_score()["score"]
             vote_granted = False
 
             if not self.score_valid:
