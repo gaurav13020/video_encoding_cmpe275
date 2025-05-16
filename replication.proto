@@ -4,6 +4,8 @@ package replication;
 
 // Service for client-master interactions and master-side operations
 service MasterService {
+  // New RPC: workers call this to join the cluster dynamically
+  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
   // Client streams UploadVideoChunk messages, server responds with one UploadVideoResponse
   rpc UploadVideo (stream UploadVideoChunk) returns (UploadVideoResponse);
   // Server streams RetrieveVideoChunk messages, client receives the stream
@@ -12,6 +14,19 @@ service MasterService {
   // For workers to report shard processing status to the master
   rpc ReportWorkerShardStatus (ReportWorkerShardStatusRequest) returns (ReportWorkerShardStatusResponse);
 }
+
+
+// Request for a worker to register itself with the master
+message RegisterWorkerRequest {
+  string worker_address = 1;  // “host:port” of the worker
+}
+
+// Response from the master acknowledging registration
+message RegisterWorkerResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
 
 // Service for master-worker interactions (processing video shards)
 service WorkerService {
