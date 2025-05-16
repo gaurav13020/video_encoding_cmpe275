@@ -1806,6 +1806,13 @@ class Node:
         if self.votes_received > total_nodes / 2:
             logging.info(f"[{self.address}] Won election with {self.votes_received} votes out of {total_nodes}")
             await self._become_master()
+        else:
+            # Reset to follower state
+            self.state = "follower"
+            if self._master_health_check_task is None or self._master_health_check_task.done():
+                logging.info(f"[{self.address}] Restarting master health check after failed election")
+                self._master_health_check_task = asyncio.create_task(self.check_master_health())
+                self._background_tasks.append(self._master_health_check_task)
 
     def _validate_stub(self, node_addr: str) -> bool:
         """Returns True if stub is valid and connected"""
@@ -2027,7 +2034,7 @@ class Node:
 
     async def check_master_health(self):
         """Periodically checks the health of the master node."""
-        while self.role == 'worker':  # Remove the "and self.current_master_address" condition
+        while self.role == 'worker': 
             if not self.current_master_address:
                 logging.info(f"[{self.address}] No master known, waiting briefly before checking again")
                 await asyncio.sleep(2)
@@ -2074,7 +2081,7 @@ class Node:
                     self.current_master_address = None
                     logging.info(f"[{self.address}] Init election after master {failed_master} removal")
                     await self._start_election_with_delay()
-                    break
+                    # break
             except Exception as e:
                 logging.error(f"[{self.address}] Error checking master health: {e}", exc_info=True)
             await asyncio.sleep(2)  # Adjust as needed
