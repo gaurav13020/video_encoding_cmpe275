@@ -66,6 +66,14 @@ class Node:
         self._master_health_check_task: Optional[asyncio.Task] = None
 
         self.node_scores = {}  # Store worker scores when acting as master
+        self.score_last_updated = 0  # When was score last calculated
+        self.score_update_interval = 10  # Seconds between updates
+        self.current_score = None  # Will store the latest score data
+
+        self.calculate_server_score(force_fresh=True)
+        # Start periodic score update task
+        score_update_task = asyncio.create_task(self._update_score_periodically())
+        self._background_tasks.append(score_update_task)
 
         self.video_statuses: Dict[str, Dict[str, Any]] = {}
 
@@ -489,11 +497,9 @@ class Node:
         return response
 
     async def RequestVote(self, request: replication_pb2.VoteRequest, context: grpc.aio.ServicerContext) -> replication_pb2.VoteResponse:
-        """Handles incoming VoteRequest RPCs using score-based election."""
+        """Handles incoming VoteRequest RPCs with improved tiebreaking."""
         logging.info(f"[{self.address}] Received VoteRequest from {request.candidate_id} with term {request.term} and score {request.score}")
 
-        vote_granted = False
-        
         # If candidate's term is less than current term, reject
         if request.term < self.current_term:
             logging.info(f"[{self.address}] Rejecting vote: candidate term {request.term} < our term {self.current_term}")
@@ -507,22 +513,61 @@ class Node:
             self.voted_for = None
             self.leader_address = None
             self.current_master_address = None
+            self.last_heartbeat_time = time.monotonic()  # Reset election timeout
             
         # Vote if we haven't voted yet in this term or already voted for this candidate
         if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
-            # Consider the candidate's score - lower scores are better
             my_score = self.calculate_server_score()["score"]
-            if request.score <= my_score:
-                self.voted_for = request.candidate_id
+            vote_granted = False
+
+            if not self.score_valid:
+                # If somehow we don't have a valid score, calculate once
+                self.calculate_server_score()
+            my_score = self.current_score["score"]
+            # THREE-TIER DECISION LOGIC:
+            # 1. Compare scores - lower is better
+            if request.score < my_score:
                 vote_granted = True
-                self.last_heartbeat_time = time.monotonic()  # Reset election timeout
-                logging.info(f"[{self.address}] Granted vote to {request.candidate_id} with score {request.score}")
+                logging.info(f"[{self.address}] Granting vote: candidate score {request.score} < our score {my_score}")
+            # 2. If scores equal, use lexicographical ordering of addresses as tiebreaker
+            elif abs(request.score - my_score) < 0.001:  # Small epsilon for float comparison
+                if request.candidate_id < self.address:  # Deterministic tiebreaker
+                    vote_granted = True
+                    logging.info(f"[{self.address}] Granting vote: tied score but candidate ID {request.candidate_id} < our ID {self.address}")
+                else:
+                    logging.info(f"[{self.address}] Rejecting vote: tied score but candidate ID {request.candidate_id} >= our ID {self.address}")
             else:
-                logging.info(f"[{self.address}] Rejected vote for {request.candidate_id}: their score {request.score} > our score {my_score}")
+                logging.info(f"[{self.address}] Rejecting vote: candidate score {request.score} > our score {my_score}")
+            
+            if vote_granted:
+                self.voted_for = request.candidate_id
+                self.last_heartbeat_time = time.monotonic()
         else:
+            vote_granted = False
             logging.info(f"[{self.address}] Already voted for {self.voted_for} in term {self.current_term}, rejecting")
 
         return replication_pb2.VoteResponse(term=self.current_term, vote_granted=vote_granted, voter_id=self.address)
+
+    def reset_election_timer(self):
+        """Resets election timer with exponential randomized backoff"""
+        base_timeout = 10  # seconds
+        max_timeout = 30   # maximum timeout
+        
+        # Use election attempts to increase backoff with each failed election
+        if not hasattr(self, 'election_attempts'):
+            self.election_attempts = 1
+        else:
+            self.election_attempts += 1
+        
+        # Exponential backoff with randomization
+        backoff_factor = min(self.election_attempts, 5)  # Cap at 5 to avoid huge delays
+        min_timeout = base_timeout * (1.5 ** backoff_factor)
+        max_timeout = min_timeout * 1.5
+        
+        self.election_timeout = random.uniform(min_timeout, max_timeout)
+        logging.info(f"[{self.address}] New election timeout: {self.election_timeout:.2f}s (attempt {self.election_attempts})")
+        self.last_heartbeat_time = time.monotonic()
+
 
     async def GetNodeStats(self, request: replication_pb2.NodeStatsRequest, context: grpc.aio.ServicerContext) -> replication_pb2.NodeStatsResponse:
         """Provides statistics about the node."""
@@ -574,8 +619,13 @@ class Node:
             is_master_known=self.current_master_address is not None
         )
     
-    def calculate_server_score(self):
+    def calculate_server_score(self, force_fresh=False):
         """Calculate a score for this node based on system metrics."""
+        # Return cached score if it's valid and fresh enough
+        if (not force_fresh and self.score_valid and 
+                (time.monotonic() - self.score_last_updated) < self.score_update_interval):
+            return self.current_score
+
         # Get system load average (1, 5, 15 minute averages)
         try:
             load_avg = os.getloadavg()[0]  # Use 1-minute average
@@ -607,7 +657,7 @@ class Node:
             + (0.4 * min(100, memory_stored))
         )
 
-        return {
+        self.current_score = {
             "server_id": self.address,
             "score": score,
             "load_avg": load_avg,
@@ -615,6 +665,10 @@ class Node:
             "net_usage_mb": net_usage,
             "memory_stored_mb": memory_stored,
         }
+        self.score_valid = True
+        self.score_last_updated = time.monotonic()
+        
+        return self.current_score
     
     async def ReportResourceScore(self, request: replication_pb2.ReportResourceScoreRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReportResourceScoreResponse:
         """Handles incoming resource scores from workers."""
@@ -651,19 +705,19 @@ class Node:
             self.state == "candidate"):
             logging.debug(f"[{self.address}] Skipping score report: No master available, I am the master, or election in progress")
             return
-
         
-        # Calculate score locally
-        my_score = self.calculate_server_score()
-        
+        # Use stored score (calculate if needed)
+        if not self.score_valid:
+            self.calculate_server_score()
+            
         # Create resource score object
         resource_score = replication_pb2.ResourceScore(
-            server_id=my_score["server_id"],
-            score=my_score["score"],
-            load_avg=my_score["load_avg"],
-            io_wait=my_score["io_wait"],
-            net_usage_mb=my_score["net_usage_mb"],
-            memory_stored_mb=my_score["memory_stored_mb"]
+            server_id=self.current_score["server_id"],
+            score=self.current_score["score"],
+            load_avg=self.current_score["load_avg"],
+            io_wait=self.current_score["io_wait"],
+            net_usage_mb=self.current_score["net_usage_mb"],
+            memory_stored_mb=self.current_score["memory_stored_mb"]
         )
         
         # Get master stub
@@ -682,6 +736,14 @@ class Node:
             logging.debug(f"[{self.address}] Successfully reported score to master")
         except Exception as e:
             logging.error(f"[{self.address}] Failed to report score to master: {e}")
+
+    async def _update_score_periodically(self):
+        """Update score periodically in the background."""
+        while not getattr(self, '_shutdown_flag', False):
+            # Calculate and store score
+            self.calculate_server_score(force_fresh=True)
+            logging.debug(f"[{self.address}] Updated score: {self.current_score['score']}")
+            await asyncio.sleep(self.score_update_interval)
         
     async def _start_score_reporting(self):
         """Periodically report score to master."""
@@ -1546,7 +1608,6 @@ class Node:
         logging.info(f"[{self.address}] Attempting to report {len(self._unreported_processed_shards)} unreported processed shards to the new master {self.current_master_address}.")
 
         shards_to_report = list(self._unreported_processed_shards.items())
-
         for (video_id, shard_id), status in shards_to_report:
             # Call _report_shard_status which will use the current master stub
             await self._report_shard_status(video_id, shard_id, status)
@@ -1626,15 +1687,51 @@ class Node:
             await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
     async def start_election(self):
-        """Initiates leader election when a master node fails."""
+        """Initiates leader election with improved coordination"""
         if self.state == "leader":
             return
 
-        # Become candidate
+        # Before becoming a candidate, verify if we should run at all
+        # my_score = self.calculate_server_score()["score"]
+        
+        # Check if there are better-scoring nodes that should be leaders instead
+        better_nodes = []
+        for node_addr in self.known_nodes:
+            if node_addr == self.address:
+                continue
+                
+            # Skip checking nodes we know are unreachable
+            if not self._validate_stub(node_addr):
+                continue
+                
+            try:
+                # Query node's score
+                node_stub = self._node_stubs.get(node_addr)
+                if node_stub:
+                    response = await asyncio.wait_for(node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout=2)
+                    node_score = response.cpu_utilization  # assuming this approximates the score
+                    if node_score < my_score:
+                        better_nodes.append((node_addr, node_score))
+            except Exception:
+                continue
+        
+        # If better candidates exist, wait longer before starting election
+        if better_nodes:
+            logging.info(f"[{self.address}] Found {len(better_nodes)} better-scoring nodes, delaying election")
+            await asyncio.sleep(random.uniform(8, 12))  # Wait for better nodes to start election
+            
+            # Check if another election is already in progress
+            if self.state != "follower" or self._pre_election_delay_task is not None:
+                logging.info(f"[{self.address}] Election already started by another node, aborting")
+                return
+        
+        # Now proceed with election
         self.state = "candidate"
         self.current_term += 1
         self.voted_for = self.address
         self.votes_received = 1  # Vote for self
+        
+        # Record failed master before clearing it
         failed_master = self.current_master_address
         self.leader_address = None
         self.current_master_address = None
@@ -1649,7 +1746,6 @@ class Node:
             term=self.current_term,
             candidate_id=self.address,
             score=score_data["score"],
-            disk_percent=score_data["memory_stored_mb"],
             memory_stored_mb=score_data["memory_stored_mb"]
         )
 
@@ -1879,11 +1975,37 @@ class Node:
         self._background_tasks.append(self._pre_election_delay_task)
 
     async def _election_delay_coro(self):
+        """Handles election delay with deadlock prevention"""
         try:
             await asyncio.sleep(self.election_timeout)
-            await self.start_election()  # Now start the election
+            
+            # Check if another node started election while we were waiting
+            if self.state != "follower" or self.current_master_address:
+                logging.info(f"[{self.address}] Aborting election - cluster state changed during delay")
+                return
+                
+            # Force election resolution after too many attempts
+            if hasattr(self, 'election_attempts') and self.election_attempts > 3:
+                logging.warning(f"[{self.address}] Detected potential election deadlock after {self.election_attempts} attempts")
+                
+                # Force resolution based on node address - deterministic across cluster
+                for node_addr in sorted(self.known_nodes + [self.address]):
+                    if node_addr == self.address:
+                        # We're the lowest node ID that's still alive - become leader
+                        logging.info(f"[{self.address}] Forcing election resolution - becoming master by ID priority")
+                        await self._become_master()
+                        return
+                    
+                    # Check if this node with better ID is alive
+                    if self._validate_stub(node_addr):
+                        logging.info(f"[{self.address}] Detected alive node {node_addr} with better ID priority")
+                        break
+            
+            # Normal election start
+            await self.start_election()
         except asyncio.CancelledError:
             logging.info(f"[{self.address}] Pre-election delay cancelled.")
+
 
     async def retry_register_with_master(self, interval: float = 5.0):
         """Periodically attempts to register with master if not yet successful."""

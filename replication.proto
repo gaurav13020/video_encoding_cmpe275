@@ -155,8 +155,7 @@ message VoteRequest {
   int32 term = 1;
   string candidate_id = 2;
   float score = 3;
-  float disk_percent = 4;
-  float memory_stored_mb = 5;
+  float memory_stored_mb = 4;
 }
 
 message VoteResponse {
