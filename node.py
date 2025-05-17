@@ -1689,9 +1689,11 @@ class Node:
         """Initiates leader election with improved coordination"""
         if self.state == "leader":
             return
-
+        
+        # Calculate our score
+        score_data = self.calculate_server_score()
+        my_score = score_data["score"]
         # Before becoming a candidate, verify if we should run at all
-        # my_score = self.calculate_server_score()["score"]
         
         # Check if there are better-scoring nodes that should be leaders instead
         better_nodes = []
@@ -1737,15 +1739,11 @@ class Node:
 
         logging.info(f"[{self.address}] Starting election for term {self.current_term}")
 
-        # Calculate our score
-        score_data = self.calculate_server_score()
-
         # Create vote request with score
         request = replication_pb2.VoteRequest(
             term=self.current_term,
             candidate_id=self.address,
-            score=score_data["score"],
-            memory_stored_mb=score_data["memory_stored_mb"]
+            score=score_data["score"]
         )
 
         # Get list of alive nodes (excluding recently failed master)
@@ -1903,28 +1901,6 @@ class Node:
             logging.error(f"[{self.address}] Unexpected error sending VoteRequest to {node_address}: {e}", exc_info=True)
             return None
 
-    async def _request_vote_from_node(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> bool:
-        """Sends a VoteRequest to a node."""
-        try:
-            response = await asyncio.wait_for(
-                node_stub.RequestVote(
-                    replication_pb2.VoteRequest(
-                        candidate_id=self.id,
-                        candidate_address=self.address,
-                        term=self.current_term
-                    ),
-                    timeout=2
-                ),
-                timeout=2
-            )
-            return response.vote_granted
-        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-            logging.warning(f"[{self.address}] Vote request to {node_address} failed: {e}")
-            return False
-        except Exception as e:
-            logging.error(f"[{self.address}] Unexpected error requesting vote from {node_address}: {e}", exc_info=True)
-            return False
-
     async def _master_election_announcement_routine(self):
         """Periodically announces this node as the master."""
 
@@ -2039,7 +2015,6 @@ class Node:
                 logging.info(f"[{self.address}] No master known, waiting briefly before checking again")
                 await asyncio.sleep(2)
                 continue
-                
             try:
                 # Get a NodeServiceStub for the master
                 master_node_channel = self._get_or_create_channel(self.current_master_address)
