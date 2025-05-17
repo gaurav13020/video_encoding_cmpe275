@@ -28,15 +28,10 @@ muxer_map = {
     'mp4':  'mp4',
     'mkv':  'matroska',
     'webm': 'webm',
-    'mov':  'mov',      # or 'mp4' if your build prefers
+    'mov':  'mov',      
 }
 
-os.makedirs(SHARDS_DIR, exist_ok=True)
-os.makedirs(MASTER_DATA_DIR, exist_ok=True)
-os.makedirs(MASTER_RETRIEVED_SHARDS_DIR, exist_ok=True)
-logging.info(f"Ensured shards directory exists at: {os.path.abspath(SHARDS_DIR)}")
-logging.info(f"Ensured master data directory exists at: {os.path.abspath(MASTER_DATA_DIR)}")
-logging.info(f"Ensured master retrieved shards directory exists at: {os.path.abspath(MASTER_RETRIEVED_SHARDS_DIR)}")
+
 
 STREAM_CHUNK_SIZE = 1024 * 1024
 
@@ -93,6 +88,13 @@ class Node:
         self._master_service_added = False
         self._worker_service_added = False
 
+        self.shards_dir = str(self.port) + "-" + SHARDS_DIR
+        if self.role == 'master':
+            os.makedirs(MASTER_DATA_DIR, exist_ok=True)
+            os.makedirs(MASTER_RETRIEVED_SHARDS_DIR, exist_ok=True)
+        logging.info(f"Ensured shards directory exists at: {os.path.abspath(self.shards_dir)}")
+        logging.info(f"Ensured master data directory exists at: {os.path.abspath(MASTER_DATA_DIR)}")
+        logging.info(f"Ensured master retrieved shards directory exists at: {os.path.abspath(MASTER_RETRIEVED_SHARDS_DIR)}")
         self.known_nodes = list(set(known_nodes))
         if self.address in self.known_nodes:
              self.known_nodes.remove(self.address)
@@ -108,6 +110,7 @@ class Node:
         if self.role == 'worker' and self.current_master_address:
             logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
             self._create_master_stubs(self.current_master_address)
+            os.makedirs(self.shards_dir, exist_ok=True)
 
             # let master know we exist
             asyncio.create_task(self.retry_register_with_master())
@@ -129,38 +132,23 @@ class Node:
         return self._channels[node_address]
 
     def _create_stubs_for_node(self, node_address: str):
-        """Creates stubs with retry logic"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                channel = self._get_or_create_channel(node_address)
-                self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
-                if self.role == 'master':
-                    self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
-                logging.info(f"[{self.address}] Created stubs for {node_address}")
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logging.error(f"[{self.address}] Failed to create stubs for {node_address} after {max_retries} attempts")
-                    if node_address in self.known_nodes:
-                        self.known_nodes.remove(node_address)
+        channel = self._get_or_create_channel(node_address)
+        self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
+        if self.role == 'master':
+            self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
+            logging.info(f"[{self.address}] Created WorkerService stub for {node_address}")
+
 
     def _create_master_stubs(self, master_address: str):
-        """Creates or updates stubs for the master node's services."""
         master_channel_valid = self._master_channel and self._master_channel_address == master_address and not self._master_channel._channel.closed()
 
         if master_channel_valid:
-             logging.debug(f"[{self.address}] Existing master channels to {master_address} are valid.")
              return
 
         if self._master_channel:
-             logging.info(f"[{self.address}] Closing old master MasterService channel to {self._master_channel_address}")
              asyncio.create_task(self._master_channel.close())
              self._master_channel = None
              self._master_channel_address = None
-
-
-        logging.info(f"[{self.address}] Creating new master channels for {master_address} with max message size {MAX_GRPC_MESSAGE_LENGTH} bytes")
 
         self._master_channel = grpc.aio.insecure_channel(
             master_address,
@@ -171,7 +159,6 @@ class Node:
         )
         self._master_channel_address = master_address
         self.master_stub = replication_pb2_grpc.MasterServiceStub(self._master_channel)
-        logging.info(f"[{self.address}] MasterService stub updated for {master_address}")
 
     def _get_or_create_master_stub(self) -> Optional[replication_pb2_grpc.MasterServiceStub]:
         """Returns the MasterService stub for the current master."""
@@ -576,7 +563,7 @@ class Node:
         memory_percent = memory_info.percent
 
         try:
-             shards_disk_usage = shutil.disk_usage(SHARDS_DIR)
+             shards_disk_usage = shutil.disk_usage(self.shards_dir)
              disk_space_free_shards = shards_disk_usage.free
              disk_space_total_shards = shards_disk_usage.total
         except Exception:
@@ -642,9 +629,9 @@ class Node:
         # Estimate memory stored (size of video shards directory)
         try:
             memory_stored = sum(
-                os.path.getsize(os.path.join(SHARDS_DIR, f)) 
-                for f in os.listdir(SHARDS_DIR) 
-                if os.path.isfile(os.path.join(SHARDS_DIR, f))
+                os.path.getsize(os.path.join(self.shards_dir , f)) 
+                for f in os.listdir(self.shards_dir ) 
+                if os.path.isfile(os.path.join(self.shards_dir , f))
             ) / (1024 * 1024)
         except:
             memory_stored = 0
@@ -876,17 +863,12 @@ class Node:
             )
 
 
+    
     async def UploadVideo(self, request_iterator: AsyncIterator[replication_pb2.UploadVideoChunk], context: grpc.aio.ServicerContext) -> replication_pb2.UploadVideoResponse:
-        """Handles video upload requests (master only)."""
         if self.role != 'master':
              return replication_pb2.UploadVideoResponse(success=False, message="This node is not the master.")
 
-        logging.info(f"[{self.address}] Received UploadVideo stream request.")
-
         video_id: Optional[str] = None
-        target_width: Optional[int] = None
-        target_height: Optional[Optional[int]] = None
-        original_filename: Optional[str] = None
         temp_input_path: Optional[str] = None
 
         try:
@@ -894,105 +876,62 @@ class Node:
             if not first_chunk.is_first_chunk:
                 raise ValueError("First chunk in UploadVideo stream must have is_first_chunk set to True.")
 
-            video_id           = first_chunk.video_id or str(uuid.uuid4())
-            target_width       = first_chunk.target_width
-            target_height      = first_chunk.target_height
-            original_filename  = first_chunk.original_filename or f"{video_id}.mp4"
+            video_id = first_chunk.video_id or str(uuid.uuid4())
+            original_filename = first_chunk.original_filename or f"{video_id}"
+            file_extension = original_filename.split('.')[-1] if '.' in original_filename else 'mp4'
 
-           
-            upscale_width      = first_chunk.upscale_width  or target_width
-            upscale_height     = first_chunk.upscale_height or target_height
-            container          = first_chunk.output_format or 'mp4'
-
-            # Decide container & codec based on requested format
-            vcodec    = 'libx264'     if container in ('mp4','mov','mkv') else 'libvpx-vp9'
-            acodec    = 'aac'         if container in ('mp4','mov','mkv') else 'libvorbis'
-            
-            logging.info(f"[{self.address}] Received metadata for video ID: {video_id}")
-
-            temp_input_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_original.tmp")
-            # Use run_in_executor for blocking file write
+            temp_input_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_original.{file_extension}")
             loop = asyncio.get_event_loop()
             with open(temp_input_path, 'wb') as f:
                 await loop.run_in_executor(None, f.write, first_chunk.data_chunk)
                 async for chunk_message in request_iterator:
-                    if chunk_message.is_first_chunk:
-                         logging.warning(f"[{self.address}] Received unexpected first chunk indicator for video ID: {video_id} in subsequent message.")
                     await loop.run_in_executor(None, f.write, chunk_message.data_chunk)
-
-            logging.info(f"[{self.address}] Finished receiving all chunks for video ID: {video_id}. File saved to {temp_input_path}")
 
             self.video_statuses[video_id] = {
                  "status": "segmenting",
-                 "container": container, 
-                 "target_width": target_width,
-                 "target_height": target_height,
-                 "original_filename": original_filename,
+                 "target_width": first_chunk.target_width,
+                 "target_height": first_chunk.target_height,
+                 "original_extension": file_extension,
                  "shards": {},
                  "retrieved_shards": {},
                  "concatenation_task": None
             }
 
-           
-
-            # Build output pattern (use the container extension)
             output_pattern = os.path.join(
                 MASTER_DATA_DIR,
-                f"{video_id}_shard_%04d.{container}"
+                f"{video_id}_shard_%04d.{file_extension}"
             )
-            segment_time = 10  # or make it another parameter
 
             try:
-                logging.info(
-                    f"[{self.address}] Starting segmentation for video {video_id} from {temp_input_path}"
-                )
-                # FFmpeg is a blocking process, run in executor
                 await loop.run_in_executor(
                     None,
                     lambda: (
                         ffmpeg
                         .input(temp_input_path)
-                        # apply scaling up/down to the requested upscale dimensions
-                        .filter("scale", upscale_width, upscale_height)
-                        # segment muxer
                         .output(
                             output_pattern,
                             format="segment",
-                            segment_time=segment_time,
-                            segment_format_options="fflags=+genpts",
+                            segment_time=10,
                             reset_timestamps=1,
-                            force_key_frames="expr:gte(t,n_forced*10)",
-                            vcodec=vcodec,
-                            acodec=acodec,
-                            **({"video_bitrate": "2M"} if vcodec == "libx264" else {}),
-                            write_prft=1,
+                            c="copy",
+                            acodec="copy",
+                            vcodec="copy"
                         )
-                        .run(
-                            capture_stdout=True,
-                            capture_stderr=True,
-                            overwrite_output=True
-                        )
+                        .run(overwrite_output=True)
                     )
                 )
-                logging.info(f"[{self.address}] Successfully segmented video {video_id}")
                 self.video_statuses[video_id]["status"] = "segmented"
 
-                shard_files = sorted(
-                    glob.glob(
-                        os.path.join(MASTER_DATA_DIR, f"{video_id}_shard_*.{container}")
-                    )
-                )
-                logging.info(f"[{self.address}] Found {len(shard_files)} shards for video {video_id}")
-
-                if not shard_files:
-                    raise Exception("No video segments were created by FFmpeg.")
-
+                shard_files = sorted(glob.glob(os.path.join(MASTER_DATA_DIR, f"{video_id}_shard_*.{file_extension}")))
                 self.video_statuses[video_id]["total_shards"] = len(shard_files)
 
-                # Distribute shards as a background task
                 distribute_task = asyncio.create_task(
                     self._distribute_shards(
-                        video_id, shard_files, target_width, target_height, original_filename
+                        video_id, 
+                        shard_files,
+                        first_chunk.target_width,
+                        first_chunk.target_height,
+                        original_filename
                     )
                 )
                 self._background_tasks.append(distribute_task)
@@ -1000,160 +939,132 @@ class Node:
                 return replication_pb2.UploadVideoResponse(
                     video_id=video_id,
                     success=True,
-                    message="Video uploaded and segmentation started."
+                    message="Video uploaded and segmented"
                 )
 
             except ffmpeg.Error as e:
-                 logging.error(f"[{self.address}] FFmpeg segmentation failed for {video_id}: {e.stderr.decode()}", exc_info=True)
                  self.video_statuses[video_id]["status"] = "failed_segmentation"
-                 self.video_statuses[video_id]["message"] = f"FFmpeg segmentation failed: {e.stderr.decode()}"
-                 return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"FFmpeg segmentation failed: {e.stderr.decode()}")
+                 return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"Segmentation failed: {e.stderr.decode()}")
             except Exception as e:
-                 logging.error(f"[{self.address}] Segmentation failed for {video_id}: {type(e).__name__} - {e}", exc_info=True)
                  self.video_statuses[video_id]["status"] = "failed_segmentation"
-                 self.video_statuses[video_id]["message"] = f"Segmentation failed: {type(e).__name__} - {e}"
                  return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"Segmentation failed: {type(e).__name__} - {e}")
 
         except Exception as e:
-             logging.error(f"[{self.address}] Error during UploadVideo stream processing for video ID {video_id}: {type(e).__name__} - {e}", exc_info=True)
              if temp_input_path and os.path.exists(temp_input_path):
-                # Use run_in_executor for blocking file removal
-                loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, os.remove, temp_input_path)
-                logging.info(f"[{self.address}] Cleaned up partial upload file: {temp_input_path}")
-             if video_id and video_id in self.video_statuses:
-                  self.video_statuses[video_id]["status"] = "upload_failed"
-                  self.video_statuses[video_id]["message"] = f"Upload stream processing failed: {type(e).__name__} - {e}"
-             else:
-                  logging.error(f"[{self.address}] Generic upload stream processing failed before video ID was determined: {type(e).__name__} - {e}", exc_info=True)
-
              return replication_pb2.UploadVideoResponse(
                  video_id=video_id if video_id else "unknown",
                  success=False,
-                 message=f"Upload stream processing failed: {type(e).__name__} - {e}"
+                 message=f"Upload failed: {type(e).__name__} - {e}"
              )
-        # finally:
-        #      # Clean up the temporary original video file AFTER segmentation
-        #      # If segmentation failed, the error handling above already cleans it up.
-        #      # If segmentation succeeded, the shards are distributed, and we can remove the original.
-        #      if temp_input_path and os.path.exists(temp_input_path) and self.video_statuses.get(video_id, {}).get("status") != "segmenting":
-        #          # Only remove if segmentation was attempted or completed.
-        #          # If segmentation failed, it's handled in the segmentation error block.
-        #          # If segmentation succeeded, the shards are distributed, and we can remove the original.
-        #          if self.video_statuses.get(video_id, {}).get("status") in ["segmented", "shards_distributed", "all_shards_processed", "processing_failed", "concatenation_failed", "concatenation_prerequisites_failed", "completed"]:
-        #              # Use run_in_executor for blocking file removal
-        #              loop = asyncio.get_event_loop()
-        #              await loop.run_in_executor(None, os.remove, temp_input_path)
-        #              logging.info(f"[{self.address}] Cleaned up original video file: {temp_input_path}")
-
-
+        
     async def _distribute_shards(self, video_id: str, shard_files: List[str], target_width: int, target_height: int, original_filename: str):
-        """Distributes video shards to available worker nodes."""
-        logging.info(f"[{self.address}] Starting distribution of {len(shard_files)} shards for video {video_id}")
+        """Distributes all shards to workers immediately using parallel tasks"""
+        logging.info(f"[{self.address}] Starting bulk distribution of {len(shard_files)} shards")
 
-        available_worker_addresses = list(self._worker_stubs.keys())
-        if not available_worker_addresses:
-             logging.error(f"[{self.address}] No workers available to process shards for video {video_id}")
-             self.video_statuses[video_id]["status"] = "failed_distribution"
-             self.video_statuses[video_id]["message"] = "No workers available."
-             return
+        max_retries = 5
+        retry_delay = 5  # seconds
+        valid_workers = []
+        for attempt in range(max_retries):
+            # Check for valid workers (non-None stubs)
+            valid_workers = [addr for addr in self._worker_stubs if self._worker_stubs.get(addr) is not None]
+            if valid_workers:
+                break
+            logging.warning(f"[{self.address}] No workers available. Retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(retry_delay)
+        if not valid_workers:
+            logging.error(f"[{self.address}] Aborting distribution: No workers after {max_retries} retries")
+            return
 
-        total_shards = len(shard_files)
-        shards_to_distribute = list(enumerate(shard_files))
+        # Create distribution tasks only for valid workers
+        distribution_tasks = []
+        for idx, shard_file in enumerate(shard_files):
+            worker = valid_workers[idx % len(valid_workers)]
+            distribution_tasks.append(
+                self._send_shard_to_worker(
+                    worker=worker,
+                    video_id=video_id,
+                    shard_file=shard_file,
+                    shard_index=idx,
+                    total_shards=len(shard_files),
+                    target_width=target_width,
+                    target_height=target_height,
+                    original_filename=original_filename
+                )
+            )
 
-        failed_to_distribute_in_round = []
-        worker_index = 0
-
-        loop = asyncio.get_event_loop() # Get the event loop for run_in_executor
-
-        while shards_to_distribute and available_worker_addresses:
-             shard_index, shard_file = shards_to_distribute.pop(0)
-             shard_id = os.path.basename(shard_file)
-
-             worker_found = False
-             for i in range(len(available_worker_addresses)):
-                 current_worker_index = (worker_index + i) % len(available_worker_addresses)
-                 worker_address = available_worker_addresses[current_worker_index]
-                 worker_stub = self._worker_stubs.get(worker_address)
-
-                 if not worker_stub:
-                    logging.warning(f"[{self.address}] No WorkerService stub for {worker_address}. Removing from available list for this round.")
-                    # Remove the worker from the list if the stub is missing
-                    if worker_address in available_worker_addresses:
-                         available_worker_addresses.remove(worker_address)
-                    continue
-
-                 try:
-                    # Use run_in_executor for blocking file read
-                    shard_data = await loop.run_in_executor(None, self._read_file_blocking, shard_file)
-
-                    request = replication_pb2.DistributeShardRequest(
-                         video_id=video_id,
-                         shard_id=shard_id,
-                         shard_data=shard_data,
-                         shard_index=shard_index,
-                         total_shards=total_shards,
-                         target_width=target_width,
-                         target_height=target_height,
-                         original_filename=original_filename
-                    )
-
-                    logging.info(f"[{self.address}] Sending shard {shard_id} ({len(shard_data)} bytes) to worker {worker_address}")
-                    response = await asyncio.wait_for(worker_stub.ProcessShard(request), timeout=30000)
-
-                    if response.success:
-                         logging.info(f"[{self.address}] Worker {worker_address} accepted shard {shard_id} for processing.")
-                         self.video_statuses[video_id]["shards"][shard_id] = {
-                             "status": "sent_to_worker",
-                             "worker_address": worker_address,
-                             "index": shard_index
-                         }
-                         # Use run_in_executor for blocking file removal
-                         await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                         worker_found = True
-                         worker_index = (current_worker_index + 1) % len(available_worker_addresses)
-                         break
-
-                    else:
-                         logging.error(f"[{self.address}] Worker {worker_address} rejected shard {shard_id}: {response.message}. Trying next available worker.")
-
-                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                    logging.error(f"[{self.address}] RPC failed or timed out when sending shard {shard_id} to {worker_address}: {e}. Removing worker from available list for this round and trying next available worker.")
-                    # Remove the worker from the list if RPC fails/times out
-                    if worker_address in available_worker_addresses:
-                         available_worker_addresses.remove(worker_address)
-                         logging.info(f"[{self.address}] Removed worker {worker_address} from available list for this distribution round.")
-
-                 except Exception as e:
-                    logging.error(f"[{self.address}] Failed to send shard {shard_id} to {worker_address}: {type(e).__name__} - {e}. Marking shard as failed distribution.", exc_info=True)
-                    self.video_statuses[video_id]["shards"][shard_id] = {
-                        "status": "failed_distribution",
-                        "worker_address": worker_address,
-                        "message": f"Failed to send: {type(e).__name__} - {e}",
-                        "index": shard_index
-                    }
-                    failed_to_distribute_in_round.append((shard_index, shard_file))
-                    worker_found = True # Consider this shard attempt finished (failed)
-                    # Use run_in_executor for blocking file removal
-                    await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                    break
-
-             if not worker_found:
-                 logging.warning(f"[{self.address}] Failed to distribute shard {shard_id} to any available worker in this round. Adding back to the distribution queue.")
-                 shards_to_distribute.append((shard_index, shard_file))
-
-        if not shards_to_distribute and not failed_to_distribute_in_round:
-             self.video_statuses[video_id]["status"] = "shards_distributed"
-             logging.info(f"[{self.address}] Finished attempting to distribute all shards for video {video_id}.")
+        # Run all distribution tasks in parallel
+        results = await asyncio.gather(*distribution_tasks, return_exceptions=True)
+        
+        # Track failures
+        successful = sum(1 for r in results if r is True)
+        failed = len(shard_files) - successful
+        
+        if failed == 0:
+            self._update_video_status(video_id, "distributed", f"All {len(shard_files)} shards distributed")
         else:
-             undistributed_count = len(shards_to_distribute) + len(failed_to_distribute_in_round)
-             self.video_statuses[video_id]["status"] = "partial_distribution_failed"
-             self.video_statuses[video_id]["message"] = f"Failed to distribute {undistributed_count} out of {total_shards} shards."
-             logging.error(f"[{self.address}] Partial distribution failed for video {video_id}. {undistributed_count} shards remain undistributed or failed.")
-             for _, shard_file in shards_to_distribute:
-                 # Use run_in_executor for blocking file removal
-                 await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                 logging.info(f"[{self.address}] Cleaned up remaining temporary shard file: {shard_file}")
+            self._update_video_status(video_id, "partial_distribution", 
+                                    f"{successful} succeeded, {failed} failed")
+
+    async def _send_shard_to_worker(self, worker: str, video_id: str, shard_file: str,
+                                shard_index: int, total_shards: int, target_width: int,
+                                target_height: int, original_filename: str):
+        """Async helper to send a single shard to a worker"""
+        try:
+            worker_stub = self._worker_stubs.get(worker)
+            if not worker_stub:
+                logging.error(f"[{self.address}] Worker stub for {worker} is missing or invalid. Cannot distribute {shard_file}.")
+                # Consider adding status update for this shard here if needed
+                return False
+
+            # Corrected: Get channel from self._channels using the worker address
+            channel = self._channels.get(worker)
+            if not channel:
+                 logging.error(f"[{self.address}] Channel for worker {worker} not found in _channels. Cannot distribute {shard_file}.")
+                 # Consider adding status update for this shard here if needed
+                 return False
+
+            # Check channel state before attempting RPC
+            if channel.get_state() == grpc.ChannelConnectivity.SHUTDOWN:
+                logging.error(f"[{self.address}] Channel to worker {worker} is shut down. Cannot distribute {shard_file}.")
+                 # Consider adding status update for this shard here if needed
+                return False
+
+
+            shard_data = await asyncio.get_event_loop().run_in_executor(
+                None, self._read_file_blocking, shard_file
+            )
+
+            request = replication_pb2.DistributeShardRequest(
+                video_id=video_id,
+                shard_id=os.path.basename(shard_file),
+                shard_data=shard_data,
+                shard_index=shard_index,
+                total_shards=total_shards,
+                target_width=target_width,
+                target_height=target_height,
+                original_filename=original_filename
+            )
+
+            logging.info(f"[{self.address}] Attempting to send shard {os.path.basename(shard_file)} to {worker}")
+            await asyncio.wait_for(
+                worker_stub.ProcessShard(request),
+                timeout=30000
+            )
+            logging.info(f"[{self.address}] Successfully sent shard {os.path.basename(shard_file)} to {worker}")
+
+
+            # Only remove the local file after successful sending
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._remove_file_blocking, shard_file
+            )
+            return True
+        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
+            logging.error(f"[{self.address}] RPC failed or timed out when distributing {shard_file} to {worker}: {type(e).__name__} - {e.details() if isinstance(e, grpc.aio.AioRpcError) else e}. Marking shard as failed distribution.", exc_info=True)
+            return False
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to distribute {shard_file} to {worker}: {type(e).__name__} - {e}. Marking shard as failed distribution.", exc_info=True)
+            return False
 
     # Helper functions for blocking file operations to be used with run_in_executor
     def _read_file_blocking(self, filepath):
@@ -1421,132 +1332,123 @@ class Node:
 
         return replication_pb2.VideoStatusResponse(video_id=video_id, status=status, message=message)
 
-    async def ProcessShard(self, request: replication_pb2.DistributeShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ProcessShardResponse:
-        logging.info(f"[{self.address}] Received ProcessShard request. Role: {self.role}")
-        if self.role != 'worker':
-            return replication_pb2.ProcessShardResponse(
-                shard_id=request.shard_id,
-                success=False,
-                message="Not a worker"
-            )
-
-        video_id       = request.video_id
-        shard_id       = request.shard_id       # e.g. "videoid_shard_0000.mkv"
-        shard_data     = request.shard_data
-        target_w       = request.target_width
-        target_h       = request.target_height
-
-        temp_in  = os.path.join(SHARDS_DIR, f"{shard_id}_input.tmp")
-        # Extract container from shard_id extension
-        container = shard_id.split('.')[-1]     # "mkv", "mp4", etc.
-        # Build output path using same extension
-        temp_out = os.path.join(
-            SHARDS_DIR,
-            f"{shard_id}_processed.{container}"
+    async def ProcessShard(self, request: replication_pb2.DistributeShardRequest, context: grpc.aio.ServicerContext):
+        # Immediately acknowledge receipt and process in background
+        asyncio.create_task(self._process_shard_background(request))
+        return replication_pb2.ProcessShardResponse(
+            shard_id=request.shard_id,
+            success=True,
+            message="Shard accepted for processing"
         )
 
-        # Choose codecs
-        vcodec = 'libx264'     if container in ('mp4','mov','mkv') else 'libvpx-vp9'
-        acodec = 'aac'         if container in ('mp4','mov','mkv') else 'libvorbis'
-
-        loop = asyncio.get_event_loop()
+    async def _process_shard_background(self, request):
+        """Actual processing in background with parallel capacity"""
+        process_dir = None # Initialize process_dir to None
         try:
-            # Write the incoming shard to disk
-            await loop.run_in_executor(None, self._write_file_blocking, temp_in, shard_data)
+            # Create unique working directory
+            process_dir = tempfile.mkdtemp(prefix=f"process_{request.shard_id}_")
+            # os.makedirs(process_dir, exist_ok=True) # mkdtemp already creates the directory
 
-            logging.info(f"[{self.address}] Processing {shard_id}: {temp_in} → {temp_out} [{container}]")
-            muxer = muxer_map.get(container, container)  # fall back to container itself
-
-
-            ff_opts = {
-                'vf':      f'scale={target_w}:{target_h}',
-                'vcodec':  vcodec,
-                'acodec':  acodec,
-                'preset':  'fast',
-                'format':  muxer,    # <- use the muxer name here,
-                'vsync': 'passthrough'  # <-- Add this line
-
-            }
-            logging.info(f"[{self.address}] FFmpeg opts: {ff_opts}")
-
-            # Run FFmpeg in executor
-            await loop.run_in_executor(None, lambda: (
-                ffmpeg
-                .input(temp_in)
-                .output(temp_out, **ff_opts)
-                .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
-            ))
-            logging.info(f"[{self.address}] Shard {shard_id} processed → {temp_out}")
-
-            # Clean up input temp
-            await loop.run_in_executor(None, os.remove, temp_in)
-
-            # Report success
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "processed_successfully")
-            )
-            self._background_tasks.append(task)
-            return replication_pb2.ProcessShardResponse(
-                shard_id=shard_id,
-                success=True,
-                message="Processed successfully"
+            # Write input file
+            input_path = os.path.join(process_dir, "input")
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._write_file_blocking, input_path, request.shard_data
             )
 
-        except ffmpeg.Error as e:
-            err = e.stderr.decode()
-            logging.error(f"[{self.address}] FFmpeg failed: {err}")
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "failed_processing", err)
+            # Determine the container (extension) from the shard_id
+            container = request.shard_id.split(".")[-1] if "." in request.shard_id else "mp4"
+            processed_output_filename = f"{request.shard_id}_processed.{container}"
+            processed_output_temp_path = os.path.join(process_dir, processed_output_filename)
+            processed_output_final_path = os.path.join(self.shards_dir, processed_output_filename)
+
+
+            # Process with FFmpeg in thread pool
+            await asyncio.get_event_loop().run_in_executor(
+                None,  # Uses default executor (thread pool)
+                self._run_ffmpeg_processing,
+                input_path,
+                request.target_width,
+                request.target_height,
+                processed_output_temp_path # Pass the temp output path to FFmpeg
             )
-            self._background_tasks.append(task)
-            return replication_pb2.ProcessShardResponse(
-                shard_id=shard_id,
-                success=False,
-                message=f"FFmpeg error: {err}"
+
+            # Move the processed file to the designated shards directory
+            await asyncio.get_event_loop().run_in_executor(
+                None, shutil.move, processed_output_temp_path, processed_output_final_path
+            )
+
+
+            await self._report_shard_status(
+                request.video_id,
+                request.shard_id,
+                "processed_successfully",
+                "Processing completed and file saved." # Provide a status message, not data
             )
 
         except Exception as e:
-            logging.error(f"[{self.address}] Processing exception: {e}", exc_info=True)
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "failed_processing", str(e))
+            logging.error(f"[{self.address}] Error processing shard {request.shard_id}: {type(e).__name__} - {e}", exc_info=True)
+            await self._report_shard_status(
+                request.video_id,
+                request.shard_id,
+                "failed_processing",
+                f"Processing failed: {type(e).__name__} - {e}"
             )
-            self._background_tasks.append(task)
-        return replication_pb2.ProcessShardResponse(
-            shard_id=shard_id,
-            success=False,
-            message=f"Error: {e}"
+        finally:
+            # Clean up the temporary directory
+            if process_dir and os.path.exists(process_dir):
+                 await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir, ignore_errors=True)
+
+
+    def _run_ffmpeg_processing(self, input_path, target_w, target_h, output_path):
+        """Synchronous FFmpeg processing in thread pool"""
+        # output_path is now passed in, no need to construct it here
+        (
+            ffmpeg
+            .input(input_path)
+            .filter('scale', w=target_w, h=target_h)
+            .output(output_path, vcodec='libx264', preset='fast', acodec='copy', loglevel='info') # Added acodec copy and loglevel
+            .run(overwrite_output=True, capture_stdout=True, capture_stderr=True) # Capture output for debugging
         )
 
     async def RequestShard(self, request: replication_pb2.RequestShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RequestShardResponse:
         shard_id = request.shard_id  # e.g. “videoid_shard_0002.mkv”
-            # Extract container (extension) from shard_id
-        container = shard_id.split(".")[-1]  # "mkv", "mp4", etc.
+        # Extract container (extension) from shard_id
+        container = shard_id.split(".")[-1] if "." in shard_id else "mp4"
         processed_fn = f"{shard_id}_processed.{container}"
-        processed_path = os.path.join(SHARDS_DIR, processed_fn)
+        processed_path = os.path.join(self.shards_dir , processed_fn)
 
         logging.info(f"[{self.address}] RequestShard for {shard_id}, looking at {processed_fn}")
 
         if not os.path.exists(processed_path):
-            msg = "Processed shard file not found."
-            logging.error(f"[{self.address}] {msg} {processed_path}")
+            msg = f"Processed shard file not found. Expected at {processed_path}" # Improved error message
+            logging.error(f"[{self.address}] {msg}")
             return replication_pb2.RequestShardResponse(
                 shard_id=shard_id, success=False, message=msg
             )
 
         # Read the correctly-named file
-        with open(processed_path, "rb") as f:
-            data = f.read()
+        try:
+            # Use run_in_executor for blocking file read
+            data = await asyncio.get_event_loop().run_in_executor(None, self._read_file_blocking, processed_path)
 
-        # Optionally clean it up
-        await asyncio.get_event_loop().run_in_executor(None, os.remove, processed_path)
-        logging.info(f"[{self.address}] Cleaned up processed shard file: {processed_fn}")
+            # Optionally clean it up - moved inside try block
+            # await asyncio.get_event_loop().run_in_executor(None, os.remove, processed_path)
+            # logging.info(f"[{self.address}] Cleaned up processed shard file: {processed_fn}")
 
-        return replication_pb2.RequestShardResponse(
-            shard_id=shard_id,
-            success=True,
-            shard_data=data, 
-            message="OK"
-        )
+            return replication_pb2.RequestShardResponse(
+                shard_id=shard_id,
+                success=True,
+                shard_data=data,
+                message="OK"
+            )
+        except Exception as e:
+             msg = f"Failed to read or clean up processed shard file {processed_fn}: {type(e).__name__} - {e}"
+             logging.error(f"[{self.address}] {msg}", exc_info=True)
+             return replication_pb2.RequestShardResponse(
+                shard_id=shard_id, success=False, message=msg
+            )
+
+   
 
 
     def _all_shards_processed_successfully(self, video_info):
