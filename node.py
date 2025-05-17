@@ -43,7 +43,7 @@ STREAM_CHUNK_SIZE = 1024 * 1024
 MAX_GRPC_MESSAGE_LENGTH = 1024 * 1024 * 1024  # 1gb
 
 class Node:
-    def __init__(self, host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
+    def __init__(self, host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
         self.host = host
         self.port = port
         self.address = f"{host}:{port}"
@@ -112,6 +112,9 @@ class Node:
             # let master know we exist
             asyncio.create_task(self.retry_register_with_master())
 
+        if self.role == 'master' and backup_servers:
+            self.backup_servers = backup_servers
+            logging.info(f"[{self.address}] Backup servers: {self.backup_servers}")
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
 
@@ -920,6 +923,35 @@ class Node:
                          logging.warning(f"[{self.address}] Received unexpected first chunk indicator for video ID: {video_id} in subsequent message.")
                     await loop.run_in_executor(None, f.write, chunk_message.data_chunk)
 
+            # Replicate the original input file to backup servers
+            if hasattr(self, 'backup_servers') and self.backup_servers:
+                logging.info(f"[{self.address}] Replicating original input file for video {video_id} to backup servers")
+                try:
+                    with open(temp_input_path, 'rb') as f:
+                        original_data = f.read()
+                    
+                    for backup_addr in self.backup_servers:
+                        try:
+                            channel = self._get_or_create_channel(backup_addr)
+                            backup_stub = replication_pb2_grpc.NodeServiceStub(channel)
+                            
+                            request = replication_pb2.ReplicateVideoRequest(
+                                video_id=f"{video_id}_original",
+                                video_data=original_data,
+                                container="tmp"  # Using tmp extension for original file
+                            )
+                            
+                            response = await backup_stub.ReplicateVideo(request)
+                            if response.success:
+                                logging.info(f"[{self.address}] Successfully replicated original input file for video {video_id} to backup server {backup_addr}")
+                            else:
+                                logging.error(f"[{self.address}] Failed to replicate original input file for video {video_id} to backup server {backup_addr}: {response.message}")
+                                
+                        except Exception as e:
+                            logging.error(f"[{self.address}] Error replicating original input file to backup server {backup_addr}: {e}")
+                except Exception as e:
+                    logging.error(f"[{self.address}] Error reading original input file for replication: {e}")
+
             logging.info(f"[{self.address}] Finished receiving all chunks for video ID: {video_id}. File saved to {temp_input_path}")
 
             self.video_statuses[video_id] = {
@@ -1332,7 +1364,11 @@ class Node:
             logging.info(f"[{self.address}] Concatenation succeeded: {output_path}")
             video_info["status"] = "completed"
             video_info["processed_video_path"] = output_path
-
+            
+            # Trigger replication to backup servers
+            replicate_task = asyncio.create_task(self._replicate_video_data(video_id, output_path))
+            self._background_tasks.append(replicate_task)
+            
         except subprocess.CalledProcessError as e:
             logging.error(f"[{self.address}] FFmpeg failed (code {e.returncode}): {e.stderr}")
             video_info["status"] = "concatenation_failed"
@@ -1518,7 +1554,7 @@ class Node:
         )
 
     async def RequestShard(self, request: replication_pb2.RequestShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RequestShardResponse:
-        shard_id = request.shard_id  # e.g. “videoid_shard_0002.mkv”
+        shard_id = request.shard_id  # e.g. "videoid_shard_0002.mkv"
             # Extract container (extension) from shard_id
         container = shard_id.split(".")[-1]  # "mkv", "mp4", etc.
         processed_fn = f"{shard_id}_processed.{container}"
@@ -1617,7 +1653,7 @@ class Node:
     async def _check_other_nodes_health(self):
         """
         Periodically checks every known node:
-        - If we don’t yet have a stub for it, try to create one.
+        - If we don't yet have a stub for it, try to create one.
         - Otherwise, call GetNodeStats() as a lightweight health‐check.
         Works whether master or workers come up in any order.
         """
@@ -1649,7 +1685,7 @@ class Node:
                         self._create_stubs_for_node(node_addr)
                         logging.info(f"[{self.address}] Stubs successfully created for {node_addr}")
                     except Exception as e:
-                        logging.debug(f"[{self.address}] Still can’t reach {node_addr}: {e}")
+                        logging.debug(f"[{self.address}] Still can't reach {node_addr}: {e}")
                     # move on whether it succeeded or not
                     continue
 
@@ -2075,10 +2111,74 @@ class Node:
         except Exception as e:
             logging.error(f"[{self.address}] Failed to get node list from master: {e}")
 
+    async def _replicate_video_data(self, video_id: str, output_path: str):
+        """Replicates video data to backup servers."""
+        if not hasattr(self, 'backup_servers') or not self.backup_servers:
+            logging.warning(f"[{self.address}] No backup servers configured for replication")
+            return
+            
+        logging.info(f"[{self.address}] Starting replication of video {video_id} to backup servers")
+        
+        for backup_addr in self.backup_servers:
+            try:
+                # Get or create channel to backup server
+                channel = self._get_or_create_channel(backup_addr)
+                backup_stub = replication_pb2_grpc.NodeServiceStub(channel)
+                
+                # Read the processed video file
+                with open(output_path, 'rb') as f:
+                    video_data = f.read()
+                    
+                # Create replication request
+                request = replication_pb2.ReplicateVideoRequest(
+                    video_id=video_id,
+                    video_data=video_data,
+                    container=os.path.splitext(output_path)[1][1:]  # Get extension without dot
+                )
+                
+                # Send to backup server
+                response = await backup_stub.ReplicateVideo(request)
+                if response.success:
+                    logging.info(f"[{self.address}] Successfully replicated video {video_id} to backup server {backup_addr}")
+                else:
+                    logging.error(f"[{self.address}] Failed to replicate video {video_id} to backup server {backup_addr}: {response.message}")
+                    
+            except Exception as e:
+                logging.error(f"[{self.address}] Error replicating to backup server {backup_addr}: {e}")
 
-async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
+    async def ReplicateVideo(self, request: replication_pb2.ReplicateVideoRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReplicateVideoResponse:
+        """Handles video replication requests from master."""
+        try:
+            video_id = request.video_id
+            video_data = request.video_data
+            container = request.container
+            
+            # Create backup directory if it doesn't exist
+            backup_dir = os.path.join(MASTER_DATA_DIR, "backup")
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            # Save the replicated video
+            output_path = os.path.join(backup_dir, f"{video_id}_processed.{container}")
+            with open(output_path, 'wb') as f:
+                f.write(video_data)
+                
+            logging.info(f"[{self.address}] Successfully replicated video {video_id} from master")
+            
+            return replication_pb2.ReplicateVideoResponse(
+                success=True,
+                message="Video replicated successfully"
+            )
+            
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to replicate video: {e}")
+            return replication_pb2.ReplicateVideoResponse(
+                success=False,
+                message=str(e)
+            )
+
+async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
     """Starts the gRPC server and initializes the node."""
-    node_instance = Node(host, port, role, master_address, known_nodes)
+    node_instance = Node(host, port, role, master_address, known_nodes, backup_servers)
     await node_instance.start()
     return node_instance # Return the node instance for shutdown
 
@@ -2090,6 +2190,8 @@ if __name__ == '__main__':
     parser.add_argument("--role", type=str, choices=['master', 'worker'], required=True, help="Role of the node (master or worker)")
     parser.add_argument("--master", type=str, help="Address of the initial master node (host:port). Required for workers.")
     parser.add_argument("--nodes", type=str, nargs='*', default=[], help="List of known node addresses (host:port) in the network.")
+    parser.add_argument("--backup-servers", type=str, nargs='*', default=[], 
+                       help="List of backup server addresses (host:port) for data replication")
 
     args = parser.parse_args()
 
@@ -2109,7 +2211,7 @@ if __name__ == '__main__':
     try:
         # Run the serve coroutine and get the node instance
         node_instance = asyncio.run(serve(args.host, args.port,
-                                        args.role, args.master, args.nodes))
+                                        args.role, args.master, args.nodes, args.backup_servers))
     except KeyboardInterrupt:
         print(f"\n[{args.host}:{args.port}] Node interrupted by user.")
     except Exception as e:
