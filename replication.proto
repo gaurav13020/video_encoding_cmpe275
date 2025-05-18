@@ -119,6 +119,8 @@ message DistributeShardRequest {
   int32 target_width = 6;
   int32 target_height = 7;
   string original_filename = 8; // Useful for worker to know original extension
+  int64 timestamp = 9;  // Unix timestamp when chunk was created
+  int32 sequence_number = 10;  // Monotonically increasing sequence number
 }
 
 message ProcessShardResponse {
@@ -137,6 +139,7 @@ message RequestShardResponse {
   bytes shard_data = 2;      // The processed shard data
   bool success = 3;
   string message = 4;
+  string metadata = 5;       // JSON string containing shard metadata (timestamp, sequence, etc.)
 }
 
 // For NodeService.AnnounceMaster

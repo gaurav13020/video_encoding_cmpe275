@@ -17,6 +17,7 @@ import sys
 import psutil
 import ffmpeg
 import random
+import json
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -976,75 +977,70 @@ class Node:
 
     async def _distribute_shards(self, video_id: str, shard_files: List[str], target_width: int, target_height: int, original_filename: str):
         """Distributes all shards to workers immediately using parallel tasks"""
-        logging.info(f"[{self.address}] Starting bulk distribution of {len(shard_files)} shards")
-
-        max_retries = 5
-        retry_delay = 5
-        valid_workers = []
-        for attempt in range(max_retries):
-
-            valid_workers = [addr for addr in self._worker_stubs if self._worker_stubs.get(addr) is not None]
-            if valid_workers:
-                break
-            logging.warning(f"[{self.address}] No workers available. Retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})")
-            await asyncio.sleep(retry_delay)
-        if not valid_workers:
-            logging.error(f"[{self.address}] Aborting distribution: No workers after {max_retries} retries")
-            return
-
-
+        logging.info(f"[{self.address}] Starting distribution of {len(shard_files)} shards for video {video_id}")
+        
+        # Sort shard files to ensure correct order
+        shard_files = sorted(shard_files)
+        
+        # Create distribution tasks for each shard
         distribution_tasks = []
-        for idx, shard_file in enumerate(shard_files):
-            worker = valid_workers[idx % len(valid_workers)]
-            distribution_tasks.append(
+        for shard_index, shard_file in enumerate(shard_files):
+            shard_id = os.path.basename(shard_file)
+            self.video_statuses[video_id]["shards"][shard_id] = {
+                "status": "pending_distribution",
+                "index": shard_index,
+                "original_index": shard_index  # Store the original index
+            }
+            
+            # Select worker based on load balancing
+            worker = self._select_worker_for_shard()
+            if not worker:
+                logging.error(f"[{self.address}] No available workers for shard {shard_id}")
+                self.video_statuses[video_id]["shards"][shard_id]["status"] = "failed_distribution"
+                continue
+                
+            # Create distribution task
+            task = asyncio.create_task(
                 self._send_shard_to_worker(
-                    worker=worker,
-                    video_id=video_id,
-                    shard_file=shard_file,
-                    shard_index=idx,
-                    total_shards=len(shard_files),
-                    target_width=target_width,
-                    target_height=target_height,
-                    original_filename=original_filename
+                    worker,
+                    video_id,
+                    shard_file,
+                    shard_index,
+                    len(shard_files),
+                    target_width,
+                    target_height,
+                    original_filename,
+                    int(time.time()),
+                    shard_index  # Use shard_index as sequence number
                 )
             )
-
-
-        results = await asyncio.gather(*distribution_tasks, return_exceptions=True)
-
-        successful = sum(1 for r in results if r is True)
-        failed = len(shard_files) - successful
-
-        if failed == 0:
-            self._update_video_status(video_id, "distributed", f"All {len(shard_files)} shards distributed")
-        else:
-            self._update_video_status(video_id, "partial_distribution",
-                                    f"{successful} succeeded, {failed} failed")
+            distribution_tasks.append(task)
+            
+        # Wait for all distribution tasks to complete
+        if distribution_tasks:
+            await asyncio.gather(*distribution_tasks)
+            
+        logging.info(f"[{self.address}] Completed distribution of all shards for video {video_id}")
 
     async def _send_shard_to_worker(self, worker: str, video_id: str, shard_file: str,
                                 shard_index: int, total_shards: int, target_width: int,
-                                target_height: int, original_filename: str):
+                                target_height: int, original_filename: str, timestamp: int,
+                                sequence_number: int):
         """Async helper to send a single shard to a worker"""
         try:
             worker_stub = self._worker_stubs.get(worker)
             if not worker_stub:
                 logging.error(f"[{self.address}] Worker stub for {worker} is missing or invalid. Cannot distribute {shard_file}.")
-
                 return False
-
 
             channel = self._channels.get(worker)
             if not channel:
-                 logging.error(f"[{self.address}] Channel for worker {worker} not found in _channels. Cannot distribute {shard_file}.")
-
-                 return False
-
+                logging.error(f"[{self.address}] Channel for worker {worker} not found in _channels. Cannot distribute {shard_file}.")
+                return False
 
             if channel.get_state() == grpc.ChannelConnectivity.SHUTDOWN:
                 logging.error(f"[{self.address}] Channel to worker {worker} is shut down. Cannot distribute {shard_file}.")
-
                 return False
-
 
             shard_data = await asyncio.get_event_loop().run_in_executor(
                 None, self._read_file_blocking, shard_file
@@ -1058,7 +1054,9 @@ class Node:
                 total_shards=total_shards,
                 target_width=target_width,
                 target_height=target_height,
-                original_filename=original_filename
+                original_filename=original_filename,
+                timestamp=timestamp,
+                sequence_number=sequence_number
             )
 
             logging.info(f"[{self.address}] Attempting to send shard {os.path.basename(shard_file)} to {worker}")
@@ -1067,27 +1065,11 @@ class Node:
                 timeout=30000
             )
             logging.info(f"[{self.address}] Successfully sent shard {os.path.basename(shard_file)} to {worker}")
-            
-            if video_id in self.video_statuses:
-                self.video_statuses[video_id]["shards"][os.path.basename(shard_file)] = {
-                    "status": "distributed",
-                    "worker_address": worker,
-                    "index": shard_index
-                }
-            else:
-                logging.error(f"[{self.address}] Video ID {video_id} missing in video_statuses during shard distribution.")
-
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._remove_file_blocking, shard_file
-            )
             return True
-        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-            logging.error(f"[{self.address}] RPC failed or timed out when distributing {shard_file} to {worker}: {type(e).__name__} - {e.details() if isinstance(e, grpc.aio.AioRpcError) else e}. Marking shard as failed distribution.", exc_info=True)
-            return False
-        except Exception as e:
-            logging.error(f"[{self.address}] Failed to distribute {shard_file} to {worker}: {type(e).__name__} - {e}. Marking shard as failed distribution.", exc_info=True)
-            return False
 
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to send shard {os.path.basename(shard_file)} to {worker}: {type(e).__name__} - {e}")
+            return False
 
     def _read_file_blocking(self, filepath):
         with open(filepath, 'rb') as f:
@@ -1146,7 +1128,6 @@ class Node:
 
         worker_stub = self._worker_stubs.get(worker_address)
 
-
         if not worker_stub:
             logging.error(f"[{self.address}] No WorkerService stub for {worker_address}. Cannot retrieve shard {shard_id}. Marking shard as retrieval failed.")
             if shard_id in self.video_statuses[video_id]["shards"]:
@@ -1161,9 +1142,11 @@ class Node:
             if response.success:
                 logging.info(f"[{self.address}] Successfully retrieved processed shard {shard_id} from {worker_address}")
                 if video_id in self.video_statuses and shard_id in self.video_statuses[video_id]["shards"]:
+                    # Get the original index from the shard's metadata
+                    original_index = self.video_statuses[video_id]["shards"][shard_id].get("original_index", -1)
                     self.video_statuses[video_id]["retrieved_shards"][shard_id] = {
                         "data": response.shard_data,
-                        "index": self.video_statuses[video_id]["shards"][shard_id].get("index", -1)
+                        "index": original_index  # Use the original index for ordering
                     }
                     self.video_statuses[video_id]["shards"][shard_id]["status"] = "retrieved"
 
@@ -1221,13 +1204,21 @@ class Node:
         shards = video_info["retrieved_shards"]
         container = video_info.get("container", "mp4")
 
-        sorted_shards = sorted(shards.items(), key=lambda item: item[1]["index"])
+        # Sort shards by their index in the original video
+        sorted_shards = sorted(
+            shards.items(),
+            key=lambda item: item[1].get("index", -1)  # Sort by the original shard index
+        )
 
         tmp_dir = tempfile.mkdtemp(prefix=f"concat_{video_id}_")
         file_list_path = os.path.join(tmp_dir, "file_list.txt")
         output_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_processed.{container}")
 
         try:
+            # Log the order of shards being concatenated
+            logging.info(f"[{self.address}] Concatenating shards in order:")
+            for shard_id, shard_data in sorted_shards:
+                logging.info(f"  - {shard_id} (index: {shard_data.get('index', -1)})")
 
             with open(file_list_path, 'w') as f:
                 for shard_id, shard_data in sorted_shards:
@@ -1236,18 +1227,16 @@ class Node:
                         shard_file.write(shard_data["data"])
                     f.write(f"file '{shard_filename}'\n")
 
-
+            # Verify all shards exist
             for shard_id, _ in sorted_shards:
                 if not os.path.exists(os.path.join(tmp_dir, shard_id)):
                     raise FileNotFoundError(f"Shard {shard_id} missing in temp dir.")
-
 
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
-                "-copytb", "1",
                 "-i", file_list_path,
                 "-c", "copy",
                 output_path
@@ -1280,7 +1269,6 @@ class Node:
         finally:
             shutil.rmtree(tmp_dir)
             logging.info(f"[{self.address}] Cleaned up temp dir: {tmp_dir}")
-
 
     def _write_file_blocking(self, filepath, data):
         with open(filepath, 'wb') as f:
@@ -1369,22 +1357,25 @@ class Node:
         """Actual processing in background with parallel capacity"""
         process_dir = None
         try:
-
             process_dir = tempfile.mkdtemp(prefix=f"process_{request.shard_id}_")
-
 
             input_path = os.path.join(process_dir, "input")
             await asyncio.get_event_loop().run_in_executor(
                 None, self._write_file_blocking, input_path, request.shard_data
             )
 
-
             container = request.shard_id.split(".")[-1] if "." in request.shard_id else "mp4"
             processed_output_filename = f"{request.shard_id}_processed.{container}"
             processed_output_temp_path = os.path.join(process_dir, processed_output_filename)
             processed_output_final_path = os.path.join(self.shards_dir, processed_output_filename)
 
-
+            # Store metadata about the shard
+            shard_metadata = {
+                "timestamp": request.timestamp,
+                "sequence_number": request.sequence_number,
+                "shard_index": request.shard_index,
+                "total_shards": request.total_shards
+            }
 
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -1395,11 +1386,16 @@ class Node:
                 processed_output_temp_path
             )
 
-
             await asyncio.get_event_loop().run_in_executor(
                 None, shutil.move, processed_output_temp_path, processed_output_final_path
             )
 
+            # Store metadata alongside the processed shard
+            metadata_path = os.path.join(self.shards_dir, f"{request.shard_id}_metadata.json")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: json.dump(shard_metadata, open(metadata_path, 'w'))
+            )
 
             await self._report_shard_status(
                 request.video_id,
@@ -1417,10 +1413,8 @@ class Node:
                 f"Processing failed: {type(e).__name__} - {e}"
             )
         finally:
-
             if process_dir and os.path.exists(process_dir):
-                 await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir, ignore_errors=True)
-
+                await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir, ignore_errors=True)
 
     def _run_ffmpeg_processing(self, input_path, target_w, target_h, output_path):
         """Synchronous FFmpeg processing in thread pool"""
@@ -1438,7 +1432,8 @@ class Node:
         container = shard_id.split(".")[-1] if "." in shard_id else "mp4"
 
         processed_fn = f"{shard_id}_processed.{container}"
-        processed_path = os.path.join(self.shards_dir , processed_fn)
+        processed_path = os.path.join(self.shards_dir, processed_fn)
+        metadata_path = os.path.join(self.shards_dir, f"{shard_id}_metadata.json")
 
         logging.info(f"[{self.address}] RequestShard for {shard_id}, looking at {processed_fn}")
 
@@ -1449,22 +1444,32 @@ class Node:
                 shard_id=shard_id, success=False, message=msg
             )
 
-
         try:
-
+            # Read the processed shard data
             data = await asyncio.get_event_loop().run_in_executor(None, self._read_file_blocking, processed_path)
 
+            # Read metadata if it exists
+            metadata = {}
+            if os.path.exists(metadata_path):
+                try:
+                    metadata = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: json.load(open(metadata_path))
+                    )
+                except Exception as e:
+                    logging.warning(f"[{self.address}] Failed to read metadata for {shard_id}: {e}")
 
             return replication_pb2.RequestShardResponse(
                 shard_id=shard_id,
                 success=True,
                 shard_data=data,
-                message="OK"
+                message="OK",
+                metadata=json.dumps(metadata)  # Include metadata in response
             )
         except Exception as e:
-             msg = f"Failed to read or clean up processed shard file {processed_fn}: {type(e).__name__} - {e}"
-             logging.error(f"[{self.address}] {msg}", exc_info=True)
-             return replication_pb2.RequestShardResponse(
+            msg = f"Failed to read or clean up processed shard file {processed_fn}: {type(e).__name__} - {e}"
+            logging.error(f"[{self.address}] {msg}", exc_info=True)
+            return replication_pb2.RequestShardResponse(
                 shard_id=shard_id, success=False, message=msg
             )
 
@@ -1569,7 +1574,7 @@ class Node:
                         self._create_stubs_for_node(node_addr)
                         logging.info(f"[{self.address}] Stubs successfully created for {node_addr}")
                     except Exception as e:
-                        logging.debug(f"[{self.address}] Still can’t reach {node_addr}: {e}")
+                        logging.debug(f"[{self.address}] Still can't reach {node_addr}: {e}")
                     # move on whether it succeeded or not
                     continue
 
@@ -2061,6 +2066,34 @@ class Node:
                 success=False,
                 message=str(e)
             )
+
+    def _select_worker_for_shard(self) -> Optional[str]:
+        """Selects a worker node for shard processing based on load balancing."""
+        if not self._worker_stubs:
+            logging.error(f"[{self.address}] No worker stubs available for shard distribution")
+            return None
+
+        # Get list of available workers
+        available_workers = []
+        for worker_addr, stub in self._worker_stubs.items():
+            channel = self._channels.get(worker_addr)
+            if channel and channel.get_state() != grpc.ChannelConnectivity.SHUTDOWN:
+                available_workers.append(worker_addr)
+
+        if not available_workers:
+            logging.error(f"[{self.address}] No available workers for shard distribution")
+            return None
+
+        # Simple round-robin selection
+        # In a real system, you might want to consider:
+        # - CPU load
+        # - Memory usage
+        # - Number of active tasks
+        # - Network latency
+        # - Disk space
+        selected_worker = available_workers[0]
+        logging.info(f"[{self.address}] Selected worker {selected_worker} for shard distribution")
+        return selected_worker
 
 async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
     """Starts the gRPC server and initializes the node."""
